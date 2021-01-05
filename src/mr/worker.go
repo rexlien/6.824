@@ -3,6 +3,9 @@ package mr
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/rexlien/go-utils/xln-utils/common"
+	priority_queue "github.com/rexlien/go-utils/xln-utils/container"
+	"hash/fnv"
 	"io"
 	"io/ioutil"
 	"os"
@@ -12,13 +15,8 @@ import (
 )
 import "log"
 import "net/rpc"
-import "hash/fnv"
 
-
-import (
-	"container/heap"
-)
-
+/*
 type Comparable interface {
 
 	 Less(j Comparable) bool
@@ -30,13 +28,6 @@ type Item struct {
 
 	index int
 	Value Comparable
-
-	//Comparable
-	//Value() Comparable
-	//Index() int
-
-
-	//SetValue(value Comparable)
 
 }
 
@@ -91,12 +82,12 @@ func (pq *PriorityQueue) update(item *Item) {
 	heap.Fix(pq, item.Index())
 }
 
-func newPriorityQueue() *PriorityQueue {
+func NewPriorityQueue() *PriorityQueue {
 	newPq := make(PriorityQueue, 0)
 	heap.Init(&newPq)
 	return &newPq
 }
-
+*/
 // This example creates a PriorityQueue with some items, adds and manipulates an item,
 // and then removes the items in priority order.
 
@@ -109,7 +100,7 @@ type KeyValue struct {
 
 }
 
-func (kv *KeyValue) Less(dst Comparable) bool {
+func (kv *KeyValue) Less(dst common.Comparable) bool {
 
 	return kv.Key < dst.(*KeyValue).Key
 }
@@ -120,7 +111,7 @@ type IndexedKeyValue struct {
 	index int
 }
 
-func (ikv *IndexedKeyValue) Less(dst Comparable) bool {
+func (ikv *IndexedKeyValue) Less(dst common.Comparable) bool {
 
 	return ikv.KeyValue.Less(dst.(*IndexedKeyValue).KeyValue)
 }
@@ -290,7 +281,7 @@ func CallGetReduceTask(reducef func(string, []string) string) bool {
 
 func Reduce(reducef func(string, []string) string, mapperCount, reducerID int) bool {
 
-	pq := newPriorityQueue()
+
 
 	inDecoder := make([]*json.Decoder, mapperCount)
 	for i:= 0; i< mapperCount; i++ {
@@ -306,10 +297,12 @@ func Reduce(reducef func(string, []string) string, mapperCount, reducerID int) b
 		//dec.Decode(&kv)
 	}
 
+	pq := priority_queue.NewPriorityQueue()
 	for i:= 0; i < mapperCount; i++ {
 
 
-		for {
+		//for {
+		/*
 			var kv KeyValue
 			err := inDecoder[i].Decode(&kv)
 
@@ -322,8 +315,13 @@ func Reduce(reducef func(string, []string) string, mapperCount, reducerID int) b
 				}
 			}
 			heap.Push(pq, &Item{
-				Value: &kv,
+				Value: &IndexedKeyValue{KeyValue: &kv, index: i},
 			})
+		//}
+
+		 */
+		if !DecodeToPQ(inDecoder[i], i, pq) {
+			break
 		}
 	}
 
@@ -346,9 +344,12 @@ func Reduce(reducef func(string, []string) string, mapperCount, reducerID int) b
 			break
 		}
 
-		front := heap.Pop(pq)
-		kv := front.(*Item).Value.(*KeyValue)
+		front := pq.Dequeue()//heap.Pop(pq)
 
+		//if()
+
+		ikv := front.(*IndexedKeyValue)
+		kv := ikv.KeyValue
 
 			if  prevKey != nil && *prevKey != kv.Key {
 				result := reducef(*prevKey, values)
@@ -359,6 +360,8 @@ func Reduce(reducef func(string, []string) string, mapperCount, reducerID int) b
 				values = values[:0]
 			}
 
+		nextDecoder := inDecoder[ikv.index]
+		DecodeToPQ(nextDecoder, ikv.index, pq)
 
 		values = append(values, kv.Value)
 		prevKey = &kv.Key
@@ -368,6 +371,26 @@ func Reduce(reducef func(string, []string) string, mapperCount, reducerID int) b
 		//fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
 	}
 
+	return true
+}
+
+func DecodeToPQ(decoder *json.Decoder, index int, pq *priority_queue.PriorityQueue) bool {
+
+	var kv KeyValue
+	err := decoder.Decode(&kv)
+
+	if err != nil {
+		if  err == io.EOF {
+			return false
+		} else {
+			fmt.Printf("Decode error: %s", err.Error())
+			panic("Decode error")
+		}
+	}
+	//heap.Push(pq, &Item{
+	//	Value: &IndexedKeyValue{KeyValue: &kv, index: index},
+	//})
+	pq.Enqueue(&IndexedKeyValue{KeyValue: &kv, index: index})
 	return true
 }
 
