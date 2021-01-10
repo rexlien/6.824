@@ -17,14 +17,22 @@ package raft
 //   in the same server.
 //
 
-import "sync"
+import (
+	"math/rand"
+	"sync"
+	"time"
+)
 import "sync/atomic"
 import "../labrpc"
 
 // import "bytes"
 // import "../labgob"
 
+type State int
 
+const LEADER State = 0
+const FOLLOWER State = 1
+const CANDIDATE State = 2
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -56,6 +64,27 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+
+	//persisted
+	currentTerm int
+	log []interface{}
+	votedFor int
+
+	state State
+
+	tickCh chan uint64
+	messageCh chan interface{}
+	ticker *time.Ticker
+
+	electionTimeout int
+	heartbeatTimeout int
+	randomElectionTimeout int
+	elapsedElectionTime int
+	elapsedHeartbeatTime int
+	r *rand.Rand
+
+	commitIndex int
+
 
 }
 
@@ -117,6 +146,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term int
+	CandidateId int
+	LastLogIndex int
+	LastLogTerm int
 }
 
 //
@@ -125,6 +158,9 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term int
+	VoteGranted bool
+
 }
 
 //
@@ -132,6 +168,15 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+
+}
+
+type AppendEntryRequest struct {
+
+}
+
+type AppendEntryReply struct {
+
 }
 
 //
@@ -233,11 +278,57 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 
+	rf.state = FOLLOWER
+	rf.log = make([]interface{}, 8)
+	rf.ticker = time.NewTicker(100 * time.Millisecond)
+	rf.r = rand.New(rand.NewSource(0))
+	rf.electionTimeout = 10
+	rf.randomElectionTimeout = rf.electionTimeout + rf.r.Intn(rf.electionTimeout)
+
+
 	// Your initialization code here (2A, 2B, 2C).
+	go func() {
+		select {
+			case _ = <- rf.ticker.C:
+				if rf.state == FOLLOWER {
+					rf.elapsedElectionTime++
+					rf.elapsedHeartbeatTime++
+
+					if rf.elapsedHeartbeatTime >= rf.randomElectionTimeout {
+						rf.currentTerm++
+						rf.state = CANDIDATE
+
+						for i := 0; i < len(peers); i++ {
+							if i != rf.me {
+								reply := RequestVoteReply{}
+								rf.sendRequestVote(i, &RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me, LastLogIndex: 0, LastLogTerm: 0}, &reply)
+
+							}
+						}
+					}
+				}
+		}
+		for {
+			if rf.state == FOLLOWER {
+
+
+			}
+
+			time.Sleep(1 * time.Second)
+		}
+
+
+	}()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 
 	return rf
+}
+
+func getElectionTimeout() int32 {
+
+	return 1000 + (rand.Int31() % 500)
+
 }
