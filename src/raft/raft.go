@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"math/rand"
 	"sync"
 	"time"
@@ -36,7 +37,15 @@ const CANDIDATE State = 2
 
 type MessageType int
 
-const MSG_RECEIVE_VOTE MessageType = 0
+const MsgSentRequestVote MessageType = 0
+const MsgReceiveRequest MessageType = 1
+const MsgSentAppendEntries MessageType = 2
+
+type RequestPair struct {
+	request interface{}
+	reply interface{}
+
+}
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -80,6 +89,8 @@ type Raft struct {
 	messageCh chan *Message
 	ticker    *time.Ticker
 
+	receiveChan chan *Message
+
 	electionTimeout       int
 	heartbeatTimeout      int
 	randomElectionTimeout int
@@ -91,11 +102,14 @@ type Raft struct {
 	quorum      int
 
 	currentVoteCount int
+	currentLeader int
 }
 
 type Message struct {
 	Type    MessageType
 	payload interface{}
+
+	waitChan chan *Message
 }
 
 // return currentTerm and whether this server
@@ -174,12 +188,36 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 
+	req := &Message{MsgReceiveRequest,&RequestPair{args, reply}, make(chan *Message)}
+	rf.receiveChan <- req
+	req = <- req.waitChan
+
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntryRequest, reply *AppendEntryReply) {
+	// Your code here (2A, 2B).
+
+	req := &Message{MsgReceiveRequest,&RequestPair{args, reply}, make(chan *Message)}
+	rf.receiveChan <- req
+	req = <- req.waitChan
+
 }
 
 type AppendEntryRequest struct {
+
+	Term int
+	LeaderId int
+	PrevLogIndex int
+	PrevLogTerm int
+	Entries[] interface{}
+	LeaderCommit int
+
 }
 
 type AppendEntryReply struct {
+
+	Term int
+	Success bool
 }
 
 //
@@ -212,7 +250,15 @@ type AppendEntryReply struct {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+
+	//fmt.Printf("Server: %d, Len: %d", server, len(rf.peers))
+
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntryRequest, reply *AppendEntryReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
 
@@ -236,6 +282,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	term = rf.currentTerm
+	isLeader = rf.me == rf.currentLeader
 
 	return index, term, isLeader
 }
@@ -272,8 +320,13 @@ func (rf *Raft) killed() bool {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 //
+
+var globalR = rand.New(rand.NewSource(time.Now().Unix()))
+
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
+	fmt.Println("Making...")
+
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
@@ -283,89 +336,183 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = FOLLOWER
 	rf.log = make([]interface{}, 8)
 	rf.ticker = time.NewTicker(100 * time.Millisecond)
-	rf.r = rand.New(rand.NewSource(0))
-	rf.electionTimeout = 10
+	//rf.r = rand.New(rand.NewSource(0))
+	rf.electionTimeout = 20
+	rf.heartbeatTimeout = 1
+	rf.messageCh = make(chan *Message)
+	rf.receiveChan = make(chan *Message)
+	rf.votedFor = -1
+	rf.currentLeader = -1
 	rf.resetElectionTimeout()
 
 	// Your initialization code here (2A, 2B, 2C).
 	go func() {
-		select {
-		case _ = <-rf.ticker.C:
-			if rf.state == FOLLOWER {
-				rf.elapsedElectionTime++
-				//rf.elapsedHeartbeatTime++
+		for {
+			select {
+			case _ = <-rf.ticker.C:
+				if rf.state == FOLLOWER {
+					rf.elapsedElectionTime++
+					//rf.elapsedHeartbeatTime++
 
-				if rf.elapsedElectionTime >= rf.randomElectionTimeout {
+					if rf.elapsedElectionTime >= rf.randomElectionTimeout {
+						fmt.Println("Election timeout..Becoming candidate")
+						rf.state = CANDIDATE
+						//voteCount := 0
 
-					rf.state = CANDIDATE
-					//voteCount := 0
+						rf.currentTerm++
+						rf.currentVoteCount = 1
+						rf.votedFor = rf.me
 
-					//c, cancel := context.WithCancel(context.Background())
+						for i := 0; i < len(peers); i++ {
+							if i != rf.me {
 
-					rf.resetElectionTimeout()
-
-
-				}
-			}
-			if rf.state == CANDIDATE {
-				rf.elapsedElectionTime++
-				rf.currentTerm++
-				rf.currentVoteCount = 1
-				rf.votedFor = rf.me
-
-				if rf.elapsedElectionTime >= rf.randomElectionTimeout {
-					for i := 0; i < len(peers); i++ {
-						if i != rf.me {
-							go func() {
-								reply := RequestVoteReply{}
-								req := &RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me, LastLogIndex: 0, LastLogTerm: 0}
-								rf.sendRequestVote(i, req, &reply)
-								//context.WithValue(c, )
-								/*
-									if reply.Term > rf.currentTerm {
-										rf.state = FOLLOWER
-										break
-									}
-									if reply.VoteGranted {
-										voteCount += 1
-									}
-
-									context.WithValue(c, req, reply)
-
-								*/
-								rf.messageCh <- &Message{Type: MSG_RECEIVE_VOTE, payload: reply}
-							}()
+								go func(i int) {
+									reply := RequestVoteReply{}
+									req := &RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me, LastLogIndex: 0, LastLogTerm: 0}
+									rf.sendRequestVote(i, req, &reply)
+									rf.messageCh <- &Message{Type: MsgSentRequestVote, payload: &reply}
+								}(i)
+							}
 						}
-					}
-					rf.resetElectionTimeout()
-				}
 
-			}
-			if rf.state == LEADER {
+						rf.resetElectionTimeout()
 
-				rf.elapsedHeartbeatTime++
-
-			}
-		case msg := <- rf.messageCh:
-			if msg.Type == MSG_RECEIVE_VOTE {
-
-				voteReply := msg.payload.(*RequestVoteReply)
-				if voteReply.Term > rf.currentTerm {
-					rf.state = FOLLOWER
-					rf.currentTerm = voteReply.Term
-					rf.currentVoteCount = 0
-					break
-				} else if voteReply.Term == rf.currentTerm {
-					if voteReply.VoteGranted {
-						rf.currentVoteCount++
-						if rf.currentVoteCount >= rf.quorum {
-							rf.state = LEADER
-
-						}
 					}
 				}
+				if rf.state == CANDIDATE {
 
+					rf.elapsedElectionTime++
+					if rf.elapsedElectionTime >= rf.randomElectionTimeout {
 
+						fmt.Println("Election timeout, become follower")
+						rf.state = FOLLOWER
+						rf.currentVoteCount = 0
+						rf.votedFor = -1
+
+						rf.resetElectionTimeout()
+					}
+
+				}
+				if rf.state == LEADER {
+
+					rf.elapsedHeartbeatTime++
+					//send heart if heartbeat timeout passed
+					if rf.elapsedHeartbeatTime >= rf.heartbeatTimeout {
+						fmt.Printf("Send Heartbeat\n")
+						for i := 0; i < len(peers); i++ {
+							if i != rf.me {
+								go func(i int) {
+									reply := AppendEntryReply{}
+									req := &AppendEntryRequest{Term: rf.currentTerm, LeaderId: rf.me, PrevLogIndex:0, PrevLogTerm:0, LeaderCommit: 0}
+									rf.sendAppendEntries(i, req, &reply)
+									rf.messageCh <- &Message{Type: MsgSentAppendEntries, payload: &reply}
+								}(i)
+							}
+						}
+						rf.elapsedHeartbeatTime = 0
+
+					}
+
+				}
+			case msg := <-rf.messageCh:
+				if msg.Type == MsgSentRequestVote {
+					//if rf.state == CANDIDATE {
+					fmt.Println("RequestVote Sent")
+					voteReply := msg.payload.(*RequestVoteReply)
+					if voteReply.Term > rf.currentTerm {
+						fmt.Println("Larger term vote received")
+						rf.state = FOLLOWER
+						rf.currentTerm = voteReply.Term
+						rf.currentVoteCount = 0
+						rf.votedFor = -1
+						rf.resetElectionTimeout()
+						break
+					} else if voteReply.Term == rf.currentTerm {
+						//fmt.Println("same term vote received")
+						if voteReply.VoteGranted {
+							fmt.Println("Got Vote granted")
+							rf.currentVoteCount++
+							if rf.state == CANDIDATE {
+								if rf.currentVoteCount >= rf.quorum {
+									fmt.Printf("%d Become Leader\n", rf.me)
+									rf.state = LEADER
+								}
+							}
+						}
+					}
+					//}
+
+				} else if msg.Type == MsgSentAppendEntries {
+
+					appendReply := msg.payload.(*AppendEntryReply)
+					//if appendReply.Success == false {
+
+						if appendReply.Term > rf.currentTerm {
+
+							rf.currentTerm = appendReply.Term
+							rf.state = FOLLOWER
+							rf.votedFor = -1
+							rf.currentVoteCount = 0
+							rf.resetElectionTimeout()
+
+						}
+					//}
+				}
+			case msg := <-rf.receiveChan:
+				if msg.Type == MsgReceiveRequest {
+					reqPair := msg.payload.(*RequestPair)
+					if requestVoteArg, _ := reqPair.request.(*RequestVoteArgs); requestVoteArg != nil {
+
+						fmt.Printf("Request Vote Received\n")
+						requestVoteReply := reqPair.reply.(*RequestVoteReply)
+
+						requestVoteReply.Term = rf.currentTerm
+						requestVoteReply.VoteGranted = false
+
+						if requestVoteArg.Term < rf.currentTerm {
+							msg.waitChan <- msg
+							break
+						}
+
+						//newer Term
+						rf.currentTerm = requestVoteArg.Term
+						requestVoteReply.Term = rf.currentTerm
+						//TODO: check index
+						if rf.votedFor == -1 {
+							rf.votedFor = requestVoteArg.CandidateId
+							fmt.Printf("Voted:%d\n", rf.votedFor)
+							requestVoteReply.VoteGranted = true
+							rf.resetElectionTimeout()
+							msg.waitChan <- msg
+							break
+						}
+
+						msg.waitChan <- msg
+
+					} else if appendEntriesArg, _:= reqPair.request.(*AppendEntryRequest); appendEntriesArg != nil {
+						appendEntriesReply := reqPair.reply.(*AppendEntryReply)
+
+						//if rf.currentTerm == appendEntriesArg.Term {
+
+						//	appendEntriesReply.Success = true
+						//} else if appendEntriesArg.Term < rf.currentTerm {
+						//	appendEntriesReply.Success = false
+						//}
+						if appendEntriesArg.Term >= rf.currentTerm {
+
+							rf.currentTerm = appendEntriesArg.Term
+							rf.state = FOLLOWER
+							rf.votedFor = -1
+							rf.currentVoteCount = 0
+							rf.resetElectionTimeout()
+						}
+						appendEntriesReply.Term = rf.currentTerm
+						appendEntriesReply.Success = true
+
+						msg.waitChan <- msg
+
+					}
+				}
 			}
 		}
 	}()
@@ -378,7 +525,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func (rf *Raft) resetElectionTimeout()  {
 
-	rf.randomElectionTimeout = rf.electionTimeout + rf.r.Intn(rf.electionTimeout)
+	rf.randomElectionTimeout = rf.electionTimeout + globalR.Intn(rf.electionTimeout)
 	rf.elapsedElectionTime = 0
+	fmt.Printf("Next Election timeout: %d\n",rf.randomElectionTimeout)
 
 }
