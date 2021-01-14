@@ -117,9 +117,13 @@ type Message struct {
 func (rf *Raft) GetState() (int, bool) {
 
 	var term int
-	var isleader bool
+	var isLeader bool
 	// Your code here (2A).
-	return term, isleader
+
+	term = rf.currentTerm
+	isLeader = rf.me == rf.currentLeader
+	fmt.Printf("Get Term: %d, curLeader = %d, IsLeader = %t\n", term, rf.currentLeader, isLeader)
+	return term, isLeader
 }
 
 //
@@ -285,6 +289,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term = rf.currentTerm
 	isLeader = rf.me == rf.currentLeader
 
+
+
 	return index, term, isLeader
 }
 
@@ -360,8 +366,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						//voteCount := 0
 
 						rf.currentTerm++
+						rf.currentLeader = -1
 						rf.currentVoteCount = 1
-						rf.votedFor = rf.me
+						rf.setVotedFor(rf.me)
 
 						for i := 0; i < len(peers); i++ {
 							if i != rf.me {
@@ -387,7 +394,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						fmt.Println("Election timeout, become follower")
 						rf.state = FOLLOWER
 						rf.currentVoteCount = 0
-						rf.votedFor = -1
+						rf.setVotedFor(-1)
 
 						rf.resetElectionTimeout()
 					}
@@ -398,7 +405,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					rf.elapsedHeartbeatTime++
 					//send heart if heartbeat timeout passed
 					if rf.elapsedHeartbeatTime >= rf.heartbeatTimeout {
-						fmt.Printf("Send Heartbeat\n")
+						//fmt.Printf("Server %d Send Heartbeat\n", rf.me)
 						for i := 0; i < len(peers); i++ {
 							if i != rf.me {
 								go func(i int) {
@@ -424,7 +431,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						rf.state = FOLLOWER
 						rf.currentTerm = voteReply.Term
 						rf.currentVoteCount = 0
-						rf.votedFor = -1
+						//rf.votedFor = -1
+						rf.setVotedFor(-1)
 						rf.resetElectionTimeout()
 						break
 					} else if voteReply.Term == rf.currentTerm {
@@ -435,6 +443,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							if rf.state == CANDIDATE {
 								if rf.currentVoteCount >= rf.quorum {
 									fmt.Printf("%d Become Leader\n", rf.me)
+									rf.currentLeader = rf.me
 									rf.state = LEADER
 								}
 							}
@@ -450,9 +459,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						if appendReply.Term > rf.currentTerm {
 
 							rf.currentTerm = appendReply.Term
-							rf.state = FOLLOWER
-							rf.votedFor = -1
-							rf.currentVoteCount = 0
+							//if rf.state != FOLLOWER {
+
+							rf.setVotedFor(-1)
+							rf.toFollower()
+
+							//} else {
+
+							//}
 							rf.resetElectionTimeout()
 
 						}
@@ -471,15 +485,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 						if requestVoteArg.Term < rf.currentTerm {
 							msg.waitChan <- msg
+							fmt.Printf("Vote Not Granted because requets Term: %d is less than current: %d\n", requestVoteArg.Term, rf.currentTerm)
 							break
 						}
 
+						if rf.currentTerm != requestVoteArg.Term {
+							rf.setVotedFor(-1)
+						}
 						//newer Term
 						rf.currentTerm = requestVoteArg.Term
 						requestVoteReply.Term = rf.currentTerm
 						//TODO: check index
 						if rf.votedFor == -1 {
-							rf.votedFor = requestVoteArg.CandidateId
+							//rf.votedFor = requestVoteArg.CandidateId
+							rf.setVotedFor(requestVoteArg.CandidateId)
 							fmt.Printf("Voted:%d\n", rf.votedFor)
 							requestVoteReply.VoteGranted = true
 							rf.resetElectionTimeout()
@@ -490,23 +509,31 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						msg.waitChan <- msg
 
 					} else if appendEntriesArg, _:= reqPair.request.(*AppendEntryRequest); appendEntriesArg != nil {
+
 						appendEntriesReply := reqPair.reply.(*AppendEntryReply)
 
 						//if rf.currentTerm == appendEntriesArg.Term {
 
-						//	appendEntriesReply.Success = true
-						//} else if appendEntriesArg.Term < rf.currentTerm {
-						//	appendEntriesReply.Success = false
-						//}
-						if appendEntriesArg.Term >= rf.currentTerm {
+						appendEntriesReply.Term = rf.currentTerm
+						//the sender is has less term
+						if appendEntriesArg.Term < rf.currentTerm {
 
-							rf.currentTerm = appendEntriesArg.Term
-							rf.state = FOLLOWER
-							rf.votedFor = -1
-							rf.currentVoteCount = 0
+							fmt.Printf("Got outdated append entries\n")
+							appendEntriesReply.Success = false
+						} else {
+
+							//fmt.Printf("get append ")
+							fmt.Printf("Got append entries from leader: %d\n", appendEntriesArg.LeaderId)
+							if rf.currentTerm != appendEntriesArg.Term {
+
+								rf.currentTerm = appendEntriesArg.Term
+								rf.setVotedFor(appendEntriesArg.LeaderId)
+							}
+							rf.currentLeader = appendEntriesArg.LeaderId
+							rf.toFollower()
 							rf.resetElectionTimeout()
 						}
-						appendEntriesReply.Term = rf.currentTerm
+
 						appendEntriesReply.Success = true
 
 						msg.waitChan <- msg
@@ -527,6 +554,17 @@ func (rf *Raft) resetElectionTimeout()  {
 
 	rf.randomElectionTimeout = rf.electionTimeout + globalR.Intn(rf.electionTimeout)
 	rf.elapsedElectionTime = 0
-	fmt.Printf("Next Election timeout: %d\n",rf.randomElectionTimeout)
+	///fmt.Printf("Next Election timeout: %d\n",rf.randomElectionTimeout)
 
+}
+
+func (rf *Raft) toFollower() {
+	rf.state = FOLLOWER
+	//rf.votedFor = -1
+	rf.currentVoteCount = 0
+}
+
+func (rf *Raft) setVotedFor(votedFor int) {
+
+	rf.votedFor = votedFor
 }
