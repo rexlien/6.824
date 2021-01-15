@@ -19,6 +19,8 @@ package raft
 
 import (
 	"fmt"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 	"math/rand"
 	"sync"
 	"time"
@@ -103,6 +105,10 @@ type Raft struct {
 
 	currentVoteCount int
 	currentLeader int
+
+	rootLoggerContext *LogContext// *zap.SugaredLogger
+	//loggerContext *LogContext
+	logger *zap.SugaredLogger
 }
 
 type Message struct {
@@ -122,7 +128,7 @@ func (rf *Raft) GetState() (int, bool) {
 
 	term = rf.currentTerm
 	isLeader = rf.me == rf.currentLeader
-	fmt.Printf("Get Term: %d, curLeader = %d, IsLeader = %t\n", term, rf.currentLeader, isLeader)
+	rf.logger.Infof("Server %d GetState Term: %d, curLeader = %d, IsLeader = %t\n", rf.me, term, rf.currentLeader, isLeader)
 	return term, isLeader
 }
 
@@ -255,7 +261,7 @@ type AppendEntryReply struct {
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 
-	//fmt.Printf("Server: %d, Len: %d", server, len(rf.peers))
+	//rf.logger.Infof("Server: %d, Len: %d", server, len(rf.peers))
 
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
@@ -327,7 +333,7 @@ func (rf *Raft) killed() bool {
 // for any long-running work.
 //
 
-var globalR = rand.New(rand.NewSource(time.Now().Unix()))
+var globalR = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
@@ -343,7 +349,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = make([]interface{}, 8)
 	rf.ticker = time.NewTicker(100 * time.Millisecond)
 	//rf.r = rand.New(rand.NewSource(0))
-	rf.electionTimeout = 20
+	rf.electionTimeout = 10
 	rf.heartbeatTimeout = 1
 	rf.messageCh = make(chan *Message)
 	rf.receiveChan = make(chan *Message)
@@ -351,6 +357,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentLeader = -1
 	rf.resetElectionTimeout()
 
+	rf.rootLoggerContext = CreateLogContext(zap.Int("server", rf.me))
+
+	//ptr := uintptr(unsafe.Pointer(&rf.currentTerm))
+	//_, rf.contextLogger = WithFields(zap.Int("server", rf.me))
+	rf.logger = WithLogContext(rf.rootLoggerContext, []zapcore.Field{}...).GetSugarLogger() //rf.contextLogger
+	//rf.logger.Info("test")
+	//rf.logger.With(zap.)
 	// Your initialization code here (2A, 2B, 2C).
 	go func() {
 		for {
@@ -361,11 +374,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					//rf.elapsedHeartbeatTime++
 
 					if rf.elapsedElectionTime >= rf.randomElectionTimeout {
-						fmt.Println("Election timeout..Becoming candidate")
+						rf.logger.Infof("Election timeout..Becoming candidate")
+
 						rf.state = CANDIDATE
 						//voteCount := 0
 
-						rf.currentTerm++
+						//rf.currentTerm++
+						rf.setTerm(rf.currentTerm + 1)
 						rf.currentLeader = -1
 						rf.currentVoteCount = 1
 						rf.setVotedFor(rf.me)
@@ -391,7 +406,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					rf.elapsedElectionTime++
 					if rf.elapsedElectionTime >= rf.randomElectionTimeout {
 
-						fmt.Println("Election timeout, become follower")
+						rf.logger.Infof("Election timeout, become follower")
 						rf.state = FOLLOWER
 						rf.currentVoteCount = 0
 						rf.setVotedFor(-1)
@@ -405,7 +420,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					rf.elapsedHeartbeatTime++
 					//send heart if heartbeat timeout passed
 					if rf.elapsedHeartbeatTime >= rf.heartbeatTimeout {
-						//fmt.Printf("Server %d Send Heartbeat\n", rf.me)
+						//rf.logger.Infof("Server %d Send Heartbeat\n", rf.me)
 						for i := 0; i < len(peers); i++ {
 							if i != rf.me {
 								go func(i int) {
@@ -424,12 +439,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			case msg := <-rf.messageCh:
 				if msg.Type == MsgSentRequestVote {
 					//if rf.state == CANDIDATE {
-					fmt.Println("RequestVote Sent")
+					rf.logger.Infof("RequestVoteResp receive")
 					voteReply := msg.payload.(*RequestVoteReply)
 					if voteReply.Term > rf.currentTerm {
-						fmt.Println("Larger term vote received")
+						rf.logger.Infof("Larger term : %d vote received", voteReply.Term)
 						rf.state = FOLLOWER
-						rf.currentTerm = voteReply.Term
+						//rf.currentTerm = voteReply.Term
+						rf.setTerm(voteReply.Term)
 						rf.currentVoteCount = 0
 						//rf.votedFor = -1
 						rf.setVotedFor(-1)
@@ -442,7 +458,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							rf.currentVoteCount++
 							if rf.state == CANDIDATE {
 								if rf.currentVoteCount >= rf.quorum {
-									fmt.Printf("%d Become Leader\n", rf.me)
+									rf.logger.Infof("%d Become Leader", rf.me)
 									rf.currentLeader = rf.me
 									rf.state = LEADER
 								}
@@ -458,7 +474,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 						if appendReply.Term > rf.currentTerm {
 
-							rf.currentTerm = appendReply.Term
+							//rf.currentTerm = appendReply.Term
+							rf.setTerm(appendReply.Term)
+
 							//if rf.state != FOLLOWER {
 
 							rf.setVotedFor(-1)
@@ -477,7 +495,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					reqPair := msg.payload.(*RequestPair)
 					if requestVoteArg, _ := reqPair.request.(*RequestVoteArgs); requestVoteArg != nil {
 
-						fmt.Printf("Request Vote Received\n")
+						rf.logger.Infof("Request Vote Received")
 						requestVoteReply := reqPair.reply.(*RequestVoteReply)
 
 						requestVoteReply.Term = rf.currentTerm
@@ -485,25 +503,28 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 						if requestVoteArg.Term < rf.currentTerm {
 							msg.waitChan <- msg
-							fmt.Printf("Vote Not Granted because requets Term: %d is less than current: %d\n", requestVoteArg.Term, rf.currentTerm)
+							rf.logger.Infof("Vote Not Granted because requets Term: %d is less than current: %d", requestVoteArg.Term, rf.currentTerm)
 							break
 						}
 
-						if rf.currentTerm != requestVoteArg.Term {
+						if requestVoteArg.Term != rf.currentTerm {
 							rf.setVotedFor(-1)
+							//rf.currentTerm = requestVoteArg.Term
+							rf.setTerm(requestVoteArg.Term)
 						}
 						//newer Term
-						rf.currentTerm = requestVoteArg.Term
 						requestVoteReply.Term = rf.currentTerm
 						//TODO: check index
-						if rf.votedFor == -1 {
+						if rf.votedFor == -1 || rf.votedFor == requestVoteArg.CandidateId {
 							//rf.votedFor = requestVoteArg.CandidateId
 							rf.setVotedFor(requestVoteArg.CandidateId)
-							fmt.Printf("Voted:%d\n", rf.votedFor)
+							rf.logger.Infof("Voted:%d\n", rf.votedFor)
 							requestVoteReply.VoteGranted = true
 							rf.resetElectionTimeout()
 							msg.waitChan <- msg
 							break
+						} else {
+							rf.logger.Infof("Server: %d already voted %d", rf.me, rf.votedFor)
 						}
 
 						msg.waitChan <- msg
@@ -518,15 +539,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						//the sender is has less term
 						if appendEntriesArg.Term < rf.currentTerm {
 
-							fmt.Printf("Got outdated append entries\n")
+							rf.logger.Infof("Server: %d in Term %d Got ex-term AppendEntries from Term: %d leader: %d\n", rf.me, rf.currentTerm, appendEntriesArg.Term, appendEntriesArg.LeaderId)
 							appendEntriesReply.Success = false
 						} else {
 
-							//fmt.Printf("get append ")
-							fmt.Printf("Got append entries from leader: %d\n", appendEntriesArg.LeaderId)
+							//rf.logger.Infof("get append ")
+							//rf.logger.Infof("Got append entries from Term: %d leader: %d\n", appendEntriesArg.LeaderId)
 							if rf.currentTerm != appendEntriesArg.Term {
 
-								rf.currentTerm = appendEntriesArg.Term
+								//rf.currentTerm = appendEntriesArg.Term
+								rf.setTerm(appendEntriesArg.Term)
 								rf.setVotedFor(appendEntriesArg.LeaderId)
 							}
 							rf.currentLeader = appendEntriesArg.LeaderId
@@ -550,12 +572,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
+func (rf *Raft) setTerm(term int) {
+	rf.currentTerm = term
+	rf.logger = WithLogContext(rf.rootLoggerContext, zap.Int("term", rf.currentTerm)).GetSugarLogger()
+
+}
+
 func (rf *Raft) resetElectionTimeout()  {
 
 	rf.randomElectionTimeout = rf.electionTimeout + globalR.Intn(rf.electionTimeout)
 	rf.elapsedElectionTime = 0
-	///fmt.Printf("Next Election timeout: %d\n",rf.randomElectionTimeout)
-
+	//rf.logger.Infof("Next Election timeout: %d\n",rf.randomElectionTimeout)
 }
 
 func (rf *Raft) toFollower() {
