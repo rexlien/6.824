@@ -41,11 +41,20 @@ type MessageType int
 
 const MsgSentRequestVote MessageType = 0
 const MsgReceiveRequest MessageType = 1
-const MsgSentAppendEntries MessageType = 2
+const MsgAppendEntriesResp MessageType = 2
+const MsgStartCommand MessageType = 3
+const MsgHeartbeatResp MessageType = 4
 
 type RequestPair struct {
 	request interface{}
 	reply interface{}
+
+}
+
+type StartCommand struct {
+	logEntry *LogEntry
+	resIndex int
+
 
 }
 
@@ -64,6 +73,13 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+}
+
+type LogEntry struct {
+
+	Command interface{}
+	Term int
+
 }
 
 //
@@ -85,12 +101,20 @@ type Raft struct {
 	log         []interface{}
 	votedFor    int
 
-	state State
+	//volatile
+	commitIndex int
+	lastApplied int
 
-	tickCh    chan uint64
-	messageCh chan *Message
+	//leader only
+	nextIndex []int
+	matchIndex []int
+
+	state State
 	ticker    *time.Ticker
 
+	tickCh    chan uint64
+	startCh chan *Message
+	messageCh chan *Message
 	receiveChan chan *Message
 
 	electionTimeout       int
@@ -100,8 +124,9 @@ type Raft struct {
 	elapsedHeartbeatTime  int
 	r                     *rand.Rand
 
-	commitIndex int
+
 	quorum      int
+	countedReplica int
 
 	currentVoteCount int
 	currentLeader int
@@ -115,20 +140,36 @@ type Message struct {
 	Type    MessageType
 	payload interface{}
 
-	waitChan chan *Message
+	doneChan chan *Message
+}
+
+type AppendEntriesMessage struct {
+
+	toServerId int
+	request *AppendEntryRequest
+	reply *AppendEntryReply
+	//doneMessage *Message
+
+	commitCh chan int
+	//commitWaiter sync.WaitGroup
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 
+	defer func() {
+		rf.mu.Unlock()
+	}()
+
 	var term int
 	var isLeader bool
 	// Your code here (2A).
 
+	rf.mu.Lock()
 	term = rf.currentTerm
 	isLeader = rf.me == rf.currentLeader
-	rf.logger.Infof("Server %d GetState Term: %d, curLeader = %d, IsLeader = %t\n", rf.me, term, rf.currentLeader, isLeader)
+	//rf.logger.Infof("Server %d GetState Term: %d, curLeader = %d, IsLeader = %t", rf.me, term, rf.currentLeader, isLeader)
 	return term, isLeader
 }
 
@@ -200,7 +241,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	req := &Message{MsgReceiveRequest,&RequestPair{args, reply}, make(chan *Message)}
 	rf.receiveChan <- req
-	req = <- req.waitChan
+	req = <- req.doneChan
 
 }
 
@@ -209,7 +250,7 @@ func (rf *Raft) AppendEntries(args *AppendEntryRequest, reply *AppendEntryReply)
 
 	req := &Message{MsgReceiveRequest,&RequestPair{args, reply}, make(chan *Message)}
 	rf.receiveChan <- req
-	req = <- req.waitChan
+	req = <- req.doneChan
 
 }
 
@@ -219,7 +260,7 @@ type AppendEntryRequest struct {
 	LeaderId int
 	PrevLogIndex int
 	PrevLogTerm int
-	Entries[] interface{}
+	Entries []*LogEntry
 	LeaderCommit int
 
 }
@@ -286,15 +327,43 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntryRequest, reply *A
 // term. the third return value is true if this server believes it is
 // the leader.
 //
-func (rf *Raft) Start(command interface{}) (int, int, bool) {
+func (rf *Raft) Start(command interface{}) (retIndex int, retTerm int , retIsLeader bool) {
+
+	defer func() {
+		//rf.mu.Unlock()
+		//retIndex = -1
+		//retTerm = 0
+		//retIsLeader = false
+	}()
+
 	index := -1
 	term := -1
 	isLeader := true
 
 	// Your code here (2B).
+
+
+
+	rf.mu.Lock()
 	term = rf.currentTerm
 	isLeader = rf.me == rf.currentLeader
+	rf.mu.Unlock()
 
+	waitChannel := make(chan *Message)
+
+	if !isLeader {
+		return -1, term, false
+	} else {
+		commandMsg := &Message{Type: MsgStartCommand, payload: &StartCommand{logEntry: &LogEntry{Command: command, Term: term}}, doneChan: waitChannel}
+		rf.startCh <- commandMsg
+	}
+
+	select {
+		case msg := <-waitChannel:
+			index = msg.payload.(*StartCommand).resIndex
+		case <- time.After(30* time.Second):
+			return -1, term, isLeader
+	}
 
 
 	return index, term, isLeader
@@ -333,6 +402,7 @@ func (rf *Raft) killed() bool {
 // for any long-running work.
 //
 
+var rMutex = sync.Mutex{}
 var globalR = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 func Make(peers []*labrpc.ClientEnd, me int,
@@ -343,19 +413,25 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
+	rf.log = make([]interface{}, 0)
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+
 	rf.quorum = len(peers)/2 + 1
 
 	rf.state = FOLLOWER
-	rf.log = make([]interface{}, 8)
 	rf.ticker = time.NewTicker(100 * time.Millisecond)
 	//rf.r = rand.New(rand.NewSource(0))
-	rf.electionTimeout = 10
+	rf.electionTimeout = 5
 	rf.heartbeatTimeout = 1
 	rf.messageCh = make(chan *Message)
 	rf.receiveChan = make(chan *Message)
+	rf.startCh = make(chan* Message)
 	rf.votedFor = -1
 	rf.currentLeader = -1
+
 	rf.resetElectionTimeout()
+	rf.resetPeerIndices()
 
 	rf.rootLoggerContext = CreateLogContext(zap.Int("server", rf.me))
 
@@ -368,6 +444,22 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go func() {
 		for {
 			select {
+			case msg := <- rf.startCh:
+				if rf.state == LEADER {
+					logEntry := msg.payload.(*StartCommand).logEntry
+					rf.log = append(rf.log, logEntry)
+
+					rf.syncAppendEntries(msg)
+					//msg.doneChan <- msg
+
+				} else {
+
+					rf.logger.Infof("Can't start: not a leader")
+					msg.payload.(*StartCommand).resIndex = -1
+					go func() {
+						msg.doneChan <- msg
+					}()
+				}
 			case _ = <-rf.ticker.C:
 				if rf.state == FOLLOWER {
 					rf.elapsedElectionTime++
@@ -381,19 +473,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 						//rf.currentTerm++
 						rf.setTerm(rf.currentTerm + 1)
-						rf.currentLeader = -1
+						///rf.currentLeader = -1
+						rf.setLeader(-1)
 						rf.currentVoteCount = 1
 						rf.setVotedFor(rf.me)
 
 						for i := 0; i < len(peers); i++ {
 							if i != rf.me {
 
-								go func(i int) {
+								go func(i int, term int) {
 									reply := RequestVoteReply{}
-									req := &RequestVoteArgs{Term: rf.currentTerm, CandidateId: rf.me, LastLogIndex: 0, LastLogTerm: 0}
+									req := &RequestVoteArgs{Term: term, CandidateId: rf.me, LastLogIndex: 0, LastLogTerm: 0}
 									rf.sendRequestVote(i, req, &reply)
 									rf.messageCh <- &Message{Type: MsgSentRequestVote, payload: &reply}
-								}(i)
+								}(i, rf.currentTerm)
 							}
 						}
 
@@ -421,16 +514,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					//send heart if heartbeat timeout passed
 					if rf.elapsedHeartbeatTime >= rf.heartbeatTimeout {
 						//rf.logger.Infof("Server %d Send Heartbeat\n", rf.me)
+						/*
 						for i := 0; i < len(peers); i++ {
 							if i != rf.me {
-								go func(i int) {
+								go func(i int, term int) {
 									reply := AppendEntryReply{}
-									req := &AppendEntryRequest{Term: rf.currentTerm, LeaderId: rf.me, PrevLogIndex:0, PrevLogTerm:0, LeaderCommit: 0}
+									req := &AppendEntryRequest{Term: term, LeaderId: rf.me, PrevLogIndex:0, PrevLogTerm:0, LeaderCommit: 0}
 									rf.sendAppendEntries(i, req, &reply)
-									rf.messageCh <- &Message{Type: MsgSentAppendEntries, payload: &reply}
-								}(i)
+									rf.messageCh <- &Message{Type: MsgAppendEntriesResp, payload: &reply}
+								}(i, rf.currentTerm)
 							}
 						}
+
+						 */
+						rf.sendHeartbeat()
 						rf.elapsedHeartbeatTime = 0
 
 					}
@@ -439,8 +536,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			case msg := <-rf.messageCh:
 				if msg.Type == MsgSentRequestVote {
 					//if rf.state == CANDIDATE {
-					rf.logger.Infof("RequestVoteResp receive")
 					voteReply := msg.payload.(*RequestVoteReply)
+					rf.logger.Infof("RequestVoteResp receive %t", voteReply.VoteGranted)
 					if voteReply.Term > rf.currentTerm {
 						rf.logger.Infof("Larger term : %d vote received", voteReply.Term)
 						rf.state = FOLLOWER
@@ -454,42 +551,86 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					} else if voteReply.Term == rf.currentTerm {
 						//fmt.Println("same term vote received")
 						if voteReply.VoteGranted {
-							fmt.Println("Got Vote granted")
+							rf.logger.Infof("Got Vote granted")
 							rf.currentVoteCount++
 							if rf.state == CANDIDATE {
 								if rf.currentVoteCount >= rf.quorum {
-									rf.logger.Infof("%d Become Leader", rf.me)
-									rf.currentLeader = rf.me
+									rf.logger.Infof("Became Leader")
+									rf.setLeader(rf.me)
 									rf.state = LEADER
+									rf.sendHeartbeat()
+									rf.elapsedHeartbeatTime = 0
 								}
 							}
 						}
 					}
 					//}
 
-				} else if msg.Type == MsgSentAppendEntries {
+				} else if msg.Type == MsgHeartbeatResp || msg.Type == MsgAppendEntriesResp{
 
-					appendReply := msg.payload.(*AppendEntryReply)
-					//if appendReply.Success == false {
 
-						if appendReply.Term > rf.currentTerm {
+					appendReply, ok := msg.payload.(*AppendEntryReply)
+					if !ok {
+						appendReply = msg.payload.(*AppendEntriesMessage).reply
+					}
 
-							//rf.currentTerm = appendReply.Term
-							rf.setTerm(appendReply.Term)
+					if appendReply.Term > rf.currentTerm {
 
-							//if rf.state != FOLLOWER {
+						rf.setTerm(appendReply.Term)
+						rf.setVotedFor(-1)
+						rf.toFollower()
+						rf.resetElectionTimeout()
 
-							rf.setVotedFor(-1)
-							rf.toFollower()
+					} else {
 
-							//} else {
+						if msg.Type == MsgAppendEntriesResp {
 
-							//}
-							rf.resetElectionTimeout()
+							rf.logger.Infof("Got MsgAppendEntriesResp")
+							appendEntriesMsg := msg.payload.(*AppendEntriesMessage)
 
+
+							if appendReply.Success {
+
+								//appendEntriesMsg.request.
+								//rf.matchIndex[]
+								newCommitIndex := appendEntriesMsg.request.PrevLogIndex + 1
+
+								if rf.matchIndex[appendEntriesMsg.toServerId] < newCommitIndex {
+									rf.matchIndex[appendEntriesMsg.toServerId] = newCommitIndex
+
+									if appendReply.Term == rf.currentTerm {
+
+										countReplica := 0
+										for i := 0; i < len(rf.matchIndex); i++ {
+
+											if rf.matchIndex[i] >= newCommitIndex {
+												countReplica++
+											}
+										}
+										if countReplica >= rf.quorum {
+											if rf.commitIndex < newCommitIndex {
+												rf.commitIndex = newCommitIndex
+											}
+										}
+
+									}
+								}
+
+								//appendEntriesMsg.doneMessage.doneChan <- appendEntriesMsg.doneMessage
+
+
+
+							} else {
+
+							}
+
+							//appendEntriesMsg.doneMessage.doneChan <- appendEntriesMsg.doneMessage
 						}
-					//}
+					}
+
+
 				}
+
 			case msg := <-rf.receiveChan:
 				if msg.Type == MsgReceiveRequest {
 					reqPair := msg.payload.(*RequestPair)
@@ -502,7 +643,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						requestVoteReply.VoteGranted = false
 
 						if requestVoteArg.Term < rf.currentTerm {
-							msg.waitChan <- msg
+							msg.doneChan <- msg
 							rf.logger.Infof("Vote Not Granted because requets Term: %d is less than current: %d", requestVoteArg.Term, rf.currentTerm)
 							break
 						}
@@ -521,16 +662,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							rf.logger.Infof("Voted:%d\n", rf.votedFor)
 							requestVoteReply.VoteGranted = true
 							rf.resetElectionTimeout()
-							msg.waitChan <- msg
+							msg.doneChan <- msg
 							break
 						} else {
 							rf.logger.Infof("Server: %d already voted %d", rf.me, rf.votedFor)
 						}
 
-						msg.waitChan <- msg
+						msg.doneChan <- msg
 
 					} else if appendEntriesArg, _:= reqPair.request.(*AppendEntryRequest); appendEntriesArg != nil {
 
+						if appendEntriesArg.Entries != nil {
+							rf.logger.Infof("Receive append entries")
+						}
 						appendEntriesReply := reqPair.reply.(*AppendEntryReply)
 
 						//if rf.currentTerm == appendEntriesArg.Term {
@@ -539,7 +683,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						//the sender is has less term
 						if appendEntriesArg.Term < rf.currentTerm {
 
-							rf.logger.Infof("Server: %d in Term %d Got ex-term AppendEntries from Term: %d leader: %d\n", rf.me, rf.currentTerm, appendEntriesArg.Term, appendEntriesArg.LeaderId)
+							rf.logger.Infof("Got ex-term AppendEntries from Term: %d leader: %d", appendEntriesArg.Term, appendEntriesArg.LeaderId)
 							appendEntriesReply.Success = false
 						} else {
 
@@ -551,14 +695,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 								rf.setTerm(appendEntriesArg.Term)
 								rf.setVotedFor(appendEntriesArg.LeaderId)
 							}
-							rf.currentLeader = appendEntriesArg.LeaderId
+							//rf.currentLeader = appendEntriesArg.LeaderId
+							rf.setLeader(appendEntriesArg.LeaderId)
 							rf.toFollower()
 							rf.resetElectionTimeout()
 						}
 
 						appendEntriesReply.Success = true
 
-						msg.waitChan <- msg
+						msg.doneChan <- msg
 
 					}
 				}
@@ -573,13 +718,32 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func (rf *Raft) setTerm(term int) {
+
+	defer func() {
+		rf.mu.Unlock()
+	}()
+
+	rf.mu.Lock()
 	rf.currentTerm = term
 	rf.logger = WithLogContext(rf.rootLoggerContext, zap.Int("term", rf.currentTerm)).GetSugarLogger()
 
 }
 
+func (rf *Raft) setLeader(id int) {
+	defer func() {
+		rf.mu.Unlock()
+	}()
+
+	rf.mu.Lock()
+	rf.currentLeader = id
+}
+
 func (rf *Raft) resetElectionTimeout()  {
 
+	defer func() {
+		rMutex.Unlock()
+	}()
+	rMutex.Lock()
 	rf.randomElectionTimeout = rf.electionTimeout + globalR.Intn(rf.electionTimeout)
 	rf.elapsedElectionTime = 0
 	//rf.logger.Infof("Next Election timeout: %d\n",rf.randomElectionTimeout)
@@ -594,4 +758,74 @@ func (rf *Raft) toFollower() {
 func (rf *Raft) setVotedFor(votedFor int) {
 
 	rf.votedFor = votedFor
+}
+
+func (rf *Raft) sendHeartbeat() {
+
+	//if rf.elapsedHeartbeatTime >= rf.heartbeatTimeout {
+		//rf.logger.Infof("Server %d Send Heartbeat\n", rf.me)
+		for i := 0; i < len(rf.peers); i++ {
+			if i != rf.me {
+				go func(i int, term int) {
+					reply := AppendEntryReply{}
+					req := &AppendEntryRequest{Term: term, LeaderId: rf.me, PrevLogIndex: 0, PrevLogTerm: -1, LeaderCommit: 0}
+					rf.sendAppendEntries(i, req, &reply)
+					rf.messageCh <- &Message{Type: MsgHeartbeatResp, payload: &reply}
+				}(i, rf.currentTerm)
+			}
+		}
+	//}
+}
+
+func (rf *Raft) syncAppendEntries(doneMessage  *Message) {
+
+	lastIndex, logEntry := rf.getLastLog()//len(rf.log)
+	//curCommit := rf.commitIndex
+
+
+	commitWaiter := sync.WaitGroup{}
+	commitWaiter.Add(rf.quorum)
+
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			if lastIndex >= rf.nextIndex[i]  {
+
+				go func(i int, term int) {
+					reply := AppendEntryReply{}
+					entries := make([]*LogEntry, 1)
+					entries[0] = logEntry
+					req := &AppendEntryRequest{Term: term, LeaderId: rf.me, PrevLogIndex: lastIndex - 1, PrevLogTerm: logEntry.Term, LeaderCommit: 0, Entries: entries}
+					//req := &AppendEntryRequest{Term: term, LeaderId: rf.me, PrevLogIndex: 0, PrevLogTerm: -1, LeaderCommit: 0}
+					fmt.Printf("Append entries sent...\n")
+					rf.sendAppendEntries(i, req, &reply)
+					fmt.Printf("Append entries sent successfully\n")
+					payload:= &AppendEntriesMessage{request: req, reply: &reply, doneMessage: doneMessage, toServerId: i}
+					rf.messageCh <- &Message{Type: MsgAppendEntriesResp, payload: payload}
+				}(i, rf.currentTerm)
+			}
+		}
+	}
+}
+
+func (rf *Raft) resetPeerIndices() {
+
+	for i:= 0; i < len(rf.nextIndex); i++ {
+		rf.nextIndex[i] = len(rf.log) + 1
+	}
+	for i:= 0; i < len(rf.matchIndex); i++ {
+		rf.matchIndex[i] = 0
+	}
+
+}
+
+func (rf *Raft) getLastLog() (int, *LogEntry) {
+
+	len := len(rf.log)
+	var last *LogEntry = nil
+
+	if len > 0 {
+		last = rf.log[len - 1].(*LogEntry)
+	}
+	return len + 1, last
+
 }
