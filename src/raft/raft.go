@@ -44,6 +44,7 @@ const MsgReceiveRequest MessageType = 1
 const MsgAppendEntriesResp MessageType = 2
 const MsgStartCommand MessageType = 3
 const MsgHeartbeatResp MessageType = 4
+const MsgCommitted MessageType = 5
 
 type RequestPair struct {
 	request interface{}
@@ -116,6 +117,8 @@ type Raft struct {
 	startCh chan *Message
 	messageCh chan *Message
 	receiveChan chan *Message
+	applyCh chan ApplyMsg
+	commitCh chan interface{}
 
 	electionTimeout       int
 	heartbeatTimeout      int
@@ -365,6 +368,8 @@ func (rf *Raft) Start(command interface{}) (retIndex int, retTerm int , retIsLea
 			return -1, term, isLeader
 	}
 
+	fmt.Printf("Start Return index: %d\n", index)
+
 
 	return index, term, isLeader
 }
@@ -427,6 +432,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.messageCh = make(chan *Message)
 	rf.receiveChan = make(chan *Message)
 	rf.startCh = make(chan* Message)
+	rf.commitCh = make(chan interface{})
+	rf.applyCh = applyCh
 	rf.votedFor = -1
 	rf.currentLeader = -1
 
@@ -438,6 +445,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	//ptr := uintptr(unsafe.Pointer(&rf.currentTerm))
 	//_, rf.contextLogger = WithFields(zap.Int("server", rf.me))
 	rf.logger = WithLogContext(rf.rootLoggerContext, []zapcore.Field{}...).GetSugarLogger() //rf.contextLogger
+
 	//rf.logger.Info("test")
 	//rf.logger.With(zap.)
 	// Your initialization code here (2A, 2B, 2C).
@@ -446,9 +454,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			select {
 			case msg := <- rf.startCh:
 				if rf.state == LEADER {
+
+					rf.logger.Infof("Start a new aggrement")
 					logEntry := msg.payload.(*StartCommand).logEntry
 					rf.log = append(rf.log, logEntry)
-
+					msg.payload.(*StartCommand).resIndex = len(rf.log)
 					rf.syncAppendEntries(msg)
 					//msg.doneChan <- msg
 
@@ -513,20 +523,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					rf.elapsedHeartbeatTime++
 					//send heart if heartbeat timeout passed
 					if rf.elapsedHeartbeatTime >= rf.heartbeatTimeout {
-						//rf.logger.Infof("Server %d Send Heartbeat\n", rf.me)
-						/*
-						for i := 0; i < len(peers); i++ {
-							if i != rf.me {
-								go func(i int, term int) {
-									reply := AppendEntryReply{}
-									req := &AppendEntryRequest{Term: term, LeaderId: rf.me, PrevLogIndex:0, PrevLogTerm:0, LeaderCommit: 0}
-									rf.sendAppendEntries(i, req, &reply)
-									rf.messageCh <- &Message{Type: MsgAppendEntriesResp, payload: &reply}
-								}(i, rf.currentTerm)
-							}
-						}
 
-						 */
 						rf.sendHeartbeat()
 						rf.elapsedHeartbeatTime = 0
 
@@ -568,7 +565,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 				} else if msg.Type == MsgHeartbeatResp || msg.Type == MsgAppendEntriesResp{
 
-
 					appendReply, ok := msg.payload.(*AppendEntryReply)
 					if !ok {
 						appendReply = msg.payload.(*AppendEntriesMessage).reply
@@ -576,6 +572,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 					if appendReply.Term > rf.currentTerm {
 
+						rf.logger.Infof("Become follower from Appendentries")
 						rf.setTerm(appendReply.Term)
 						rf.setVotedFor(-1)
 						rf.toFollower()
@@ -588,13 +585,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							rf.logger.Infof("Got MsgAppendEntriesResp")
 							appendEntriesMsg := msg.payload.(*AppendEntriesMessage)
 
-
 							if appendReply.Success {
 
-								//appendEntriesMsg.request.
-								//rf.matchIndex[]
 								newCommitIndex := appendEntriesMsg.request.PrevLogIndex + 1
-
 								if rf.matchIndex[appendEntriesMsg.toServerId] < newCommitIndex {
 									rf.matchIndex[appendEntriesMsg.toServerId] = newCommitIndex
 
@@ -607,31 +600,50 @@ func Make(peers []*labrpc.ClientEnd, me int,
 												countReplica++
 											}
 										}
-										if countReplica >= rf.quorum {
+										if countReplica == rf.quorum - 1 {
 											if rf.commitIndex < newCommitIndex {
 												rf.commitIndex = newCommitIndex
 											}
-										}
+											go func(logger *zap.SugaredLogger) {
+												/*
+												select {
+													case appendEntriesMsg.commitCh <- newCommitIndex:
+													case <- time.After(time.Second * 15):
+														logger.Infof("send commitCh timeout")
+												}
+*/
+												logger.Infof("send commit chennel")
+												rf.commitCh <- appendEntriesMsg
 
+											}(rf.logger)
+										}
 									}
 								}
 
-								//appendEntriesMsg.doneMessage.doneChan <- appendEntriesMsg.doneMessage
-
-
+								if rf.nextIndex[appendEntriesMsg.toServerId] < newCommitIndex {
+									rf.nextIndex[appendEntriesMsg.toServerId] = newCommitIndex
+								}
 
 							} else {
-
+								rf.logger.Infof("append entry false")
 							}
 
-							//appendEntriesMsg.doneMessage.doneChan <- appendEntriesMsg.doneMessage
 						}
 					}
-
-
 				}
+				case msg := <-rf.commitCh:
+					rf.logger.Infof("Committed received")
+					appendEntriesMessage, ok := msg.(*AppendEntriesMessage)
+					if ok {
+						rf.applyCommitted()
+						appendEntriesMessage.commitCh <- 1
+					} else {
+						rf.applyCommitted()
+					}
 
-			case msg := <-rf.receiveChan:
+					//appendEntriesMessage.commitCh
+
+				case msg := <-rf.receiveChan:
 				if msg.Type == MsgReceiveRequest {
 					reqPair := msg.payload.(*RequestPair)
 					if requestVoteArg, _ := reqPair.request.(*RequestVoteArgs); requestVoteArg != nil {
@@ -672,9 +684,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 					} else if appendEntriesArg, _:= reqPair.request.(*AppendEntryRequest); appendEntriesArg != nil {
 
-						if appendEntriesArg.Entries != nil {
-							rf.logger.Infof("Receive append entries")
-						}
 						appendEntriesReply := reqPair.reply.(*AppendEntryReply)
 
 						//if rf.currentTerm == appendEntriesArg.Term {
@@ -687,21 +696,75 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							appendEntriesReply.Success = false
 						} else {
 
-							//rf.logger.Infof("get append ")
-							//rf.logger.Infof("Got append entries from Term: %d leader: %d\n", appendEntriesArg.LeaderId)
 							if rf.currentTerm != appendEntriesArg.Term {
 
-								//rf.currentTerm = appendEntriesArg.Term
 								rf.setTerm(appendEntriesArg.Term)
 								rf.setVotedFor(appendEntriesArg.LeaderId)
 							}
+
+							if appendEntriesArg.Entries != nil {
+								rf.logger.Infof("Receive append entries")
+
+								if appendEntriesArg.PrevLogIndex > 0 {
+
+									arrayIndex := appendEntriesArg.PrevLogIndex - 1
+									if arrayIndex < len(rf.log) {
+										if appendEntriesArg.PrevLogTerm != rf.log[arrayIndex].(*LogEntry).Term {
+
+											appendEntriesReply.Success = false
+											//delete all follows it
+
+										} else {
+											//prevLogEntry := rf.log[appendEntriesArg.PrevLogIndex]
+											rf.logger.Infof("sync entries")
+											for i:= 0; i < len(appendEntriesArg.Entries); i++ {
+												rf.log = append(rf.log, appendEntriesArg.Entries[i])
+											}
+											appendEntriesReply.Success = true
+										}
+
+										//appendEntriesReply.Success = false
+									} else {
+
+										//prev index is empty
+										appendEntriesReply.Success = false
+
+									}
+								} else {
+									//just copy
+									rf.logger.Infof("sync entries")
+									for i:= 0; i < len(appendEntriesArg.Entries); i++ {
+										rf.log = append(rf.log, appendEntriesArg.Entries[i])
+									}
+									//rf.commitIndex = appendEntriesArg.LeaderCommit
+									appendEntriesReply.Success = true
+								}
+
+							} else {
+								appendEntriesReply.Success = true
+							}
+
+							lastIndex, _ := rf.getLastLog()
+
+							if appendEntriesArg.LeaderCommit > rf.commitIndex && lastIndex >= appendEntriesArg.LeaderCommit {
+								rf.commitIndex = appendEntriesArg.LeaderCommit
+
+								go func() {
+									rf.commitCh <- 1
+								}()
+
+
+								//rf.applyCommitted()
+							}
+							//rf.commitIndex
+
 							//rf.currentLeader = appendEntriesArg.LeaderId
 							rf.setLeader(appendEntriesArg.LeaderId)
 							rf.toFollower()
 							rf.resetElectionTimeout()
 						}
 
-						appendEntriesReply.Success = true
+
 
 						msg.doneChan <- msg
 
@@ -738,6 +801,21 @@ func (rf *Raft) setLeader(id int) {
 	rf.currentLeader = id
 }
 
+func (rf *Raft) applyCommitted() {
+
+	if rf.lastApplied < rf.commitIndex {
+
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			command := rf.log[i-1].(*LogEntry).Command
+			applyMsg := ApplyMsg{Command: command, CommandValid: true, CommandIndex: i}
+			rf.applyCh <- applyMsg
+
+		}
+		rf.logger.Infof("End apply from %d to %d", rf.lastApplied, rf.commitIndex)
+		rf.lastApplied = rf.commitIndex
+	}
+}
+
 func (rf *Raft) resetElectionTimeout()  {
 
 	defer func() {
@@ -766,12 +844,12 @@ func (rf *Raft) sendHeartbeat() {
 		//rf.logger.Infof("Server %d Send Heartbeat\n", rf.me)
 		for i := 0; i < len(rf.peers); i++ {
 			if i != rf.me {
-				go func(i int, term int) {
+				go func(i int, term int, leaderCommitIndex int) {
 					reply := AppendEntryReply{}
-					req := &AppendEntryRequest{Term: term, LeaderId: rf.me, PrevLogIndex: 0, PrevLogTerm: -1, LeaderCommit: 0}
+					req := &AppendEntryRequest{Term: term, LeaderId: rf.me, PrevLogIndex: 0, PrevLogTerm: -1, LeaderCommit: leaderCommitIndex}
 					rf.sendAppendEntries(i, req, &reply)
 					rf.messageCh <- &Message{Type: MsgHeartbeatResp, payload: &reply}
-				}(i, rf.currentTerm)
+				}(i, rf.currentTerm, rf.commitIndex)
 			}
 		}
 	//}
@@ -780,31 +858,47 @@ func (rf *Raft) sendHeartbeat() {
 func (rf *Raft) syncAppendEntries(doneMessage  *Message) {
 
 	lastIndex, logEntry := rf.getLastLog()//len(rf.log)
-	//curCommit := rf.commitIndex
 
 
-	commitWaiter := sync.WaitGroup{}
-	commitWaiter.Add(rf.quorum)
-
+	//leaderCommit := rf.commitIndex
+	commitCh := make(chan int)
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			if lastIndex >= rf.nextIndex[i]  {
 
-				go func(i int, term int) {
+				go func(i int, term int, index int, leaderCommitIndex int) {
 					reply := AppendEntryReply{}
 					entries := make([]*LogEntry, 1)
 					entries[0] = logEntry
-					req := &AppendEntryRequest{Term: term, LeaderId: rf.me, PrevLogIndex: lastIndex - 1, PrevLogTerm: logEntry.Term, LeaderCommit: 0, Entries: entries}
+					req := &AppendEntryRequest{Term: term, LeaderId: rf.me, PrevLogIndex: lastIndex - 1, PrevLogTerm: logEntry.Term, LeaderCommit: leaderCommitIndex, Entries: entries}
 					//req := &AppendEntryRequest{Term: term, LeaderId: rf.me, PrevLogIndex: 0, PrevLogTerm: -1, LeaderCommit: 0}
-					fmt.Printf("Append entries sent...\n")
+					//fmt.Printf("Append entries sent...\n")
 					rf.sendAppendEntries(i, req, &reply)
-					fmt.Printf("Append entries sent successfully\n")
-					payload:= &AppendEntriesMessage{request: req, reply: &reply, doneMessage: doneMessage, toServerId: i}
+					//fmt.Printf("Append entries sent successfully\n")
+					payload:= &AppendEntriesMessage{request: req, reply: &reply, commitCh: commitCh, toServerId: i}
 					rf.messageCh <- &Message{Type: MsgAppendEntriesResp, payload: payload}
-				}(i, rf.currentTerm)
+				}(i, rf.currentTerm, rf.nextIndex[i], rf.commitIndex)
 			}
 		}
 	}
+
+	go func(logger* zap.SugaredLogger) {
+
+		looping:= true
+		for looping {
+			select {
+			case _ = <-commitCh:
+				doneMessage.doneChan <- doneMessage
+				looping = false
+			case <-time.After(15 * time.Second):
+				logger.Infof("recieve commit channel timedout")
+				doneMessage.payload.(*StartCommand).resIndex = -1
+				doneMessage.doneChan <- doneMessage
+				looping = false
+			}
+		}
+		close(commitCh)
+	}(rf.logger)
 }
 
 func (rf *Raft) resetPeerIndices() {
@@ -826,6 +920,6 @@ func (rf *Raft) getLastLog() (int, *LogEntry) {
 	if len > 0 {
 		last = rf.log[len - 1].(*LogEntry)
 	}
-	return len + 1, last
+	return len, last
 
 }
