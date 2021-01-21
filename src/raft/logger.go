@@ -40,12 +40,15 @@ func WithFields(fields... zapcore.Field) (*zap.Logger, *zap.SugaredLogger) {
 
 
 func createLogger() *zap.Logger{
-	zapConfig := zap.NewProductionConfig()
+	zapConfig := zap.NewDevelopmentConfig()
+	zapConfig.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
 	l, err := zapConfig.Build(
 		zap.AddCaller(), zap.AddStacktrace(zapcore.ErrorLevel))
+
 	if err != nil {
 		panic("create logger failed")
 	}
+
 	return l
 }
 
