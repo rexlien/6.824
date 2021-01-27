@@ -473,7 +473,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 			case msg := <- rf.startCh:
 				if rf.state == LEADER {
 
-					rf.logger.Infof("Start a new aggrement")
+					rf.logger.Infof("Start a new aggrement %+v", msg.payload.(*StartCommand).logEntry)
 					logEntry := msg.payload.(*StartCommand).logEntry
 					rf.log = append(rf.log, logEntry)
 					msg.payload.(*StartCommand).resIndex = len(rf.log)
@@ -671,7 +671,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 										rf.nextIndex[appendEntriesMsg.toServerId] = appendEntriesMsg.reply.XLen
 
 										newPrev := appendEntriesMsg.reply.XLen
-										newPrevTerm := rf.log[newPrev - 1].(*LogEntry).Term
+										newPrevTerm := 0
+										if newPrev > 0 {
+											newPrevTerm = rf.log[newPrev - 1].(*LogEntry).Term
+										}
 										entries := rf.getLogEntries(newPrev + 1, -1)
 
 										rf.resendAppendEntriesMessage(entries, appendEntriesMsg, newPrev, newPrevTerm)
@@ -814,7 +817,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 											}
 
 											appendEntriesReply.XIndex = xIndex + 1
-											rf.logger.Infof("append entries not consistent of term %d, from %d", appendEntriesReply.XTerm, appendEntriesReply.XIndex, rf.printLog())
+											rf.logger.Infof("append entries not consistent of term %d, from %d: log: %s", appendEntriesReply.XTerm, appendEntriesReply.XIndex, rf.printLog())
 											appendEntriesReply.Success = AeEntriesAppendFailed
 											//delete all follows it
 
@@ -825,7 +828,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 											for i:= 0; i < len(appendEntriesArg.Entries); i++ {
 												interfaces[i] = appendEntriesArg.Entries[i]
 											}
-											rf.log = append(rf.log[0:arrayIndex+1], interfaces...)
+
+
+											//if len(rf.log) >= len(interfaces) + arrayIndex {
+											//
+											//}
+											tmpSlice := append(rf.log[0:arrayIndex+1], interfaces...)
+											rf.log = append(tmpSlice, rf.log[arrayIndex+1:len(rf.log)]...)
+											//rf.log = append(rf.log[0:arrayIndex+1], interfaces...)
 
 											rf.logger.Infof("Server: %d, Append Sucessfully: %s", rf.me, rf.printLog())
 											appendEntriesReply.Success = AeEntriesAppendSuccess
@@ -858,18 +868,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 								appendEntriesReply.Success = AeEntriesAppendSuccess
 							}
 
-							lastIndex, _ , _:= rf.getLogFromLast(0)
 
-							if appendEntriesArg.LeaderCommit > rf.commitIndex && lastIndex >= appendEntriesArg.LeaderCommit {
-								rf.commitIndex = appendEntriesArg.LeaderCommit
-
-								go func() {
-									rf.commitCh <- -1
-								}()
-
-
-								//rf.applyCommitted()
-							}
 							//rf.commitIndex
 
 							//rf.currentLeader = appendEntriesArg.LeaderId
@@ -878,6 +877,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							rf.resetElectionTimeout()
 						}
 
+						lastIndex, _ , term := rf.getLogFromLast(0)
+
+						if appendEntriesArg.LeaderCommit > rf.commitIndex && term == appendEntriesArg.Term {
+
+							rf.logger.Debugf("New entries Commit:%d", appendEntriesArg.LeaderCommit)
+							rf.commitIndex = appendEntriesArg.LeaderCommit
+							if rf.commitIndex >= lastIndex {
+								rf.commitIndex = lastIndex
+							}
+
+							go func() {
+								rf.commitCh <- -1
+							}()
+
+						}
 
 
 						msg.doneChan <- msg
@@ -954,15 +968,31 @@ func (rf *Raft) setVotedFor(votedFor int) {
 
 func (rf *Raft) sendHeartbeat() {
 
+	lastIndex, _, _ := rf.getLogFromLast(0)
+	prevIndex, _, prevTerm := rf.getLogFromLast(1)
 	//if rf.elapsedHeartbeatTime >= rf.heartbeatTimeout {
 		//rf.logger.Infof("Server %d Send Heartbeat\n", rf.me)
 		for i := 0; i < len(rf.peers); i++ {
 			if i != rf.me {
+				var newEntries []*LogEntry
+				if lastIndex >= rf.nextIndex[i] {
+
+					//newEntries = rf.getLogEntries(rf.nextIndex[i], -1)
+					//rf.logger.Infof("Heart found next index, new entries: %s", rf.printLogEntries(newEntries))
+				}
+
 				go func(i int, term int, leaderCommitIndex int) {
 					reply := AppendEntryReply{}
-					req := &AppendEntryRequest{Term: term, LeaderId: rf.me, PrevLogIndex: 0, PrevLogTerm: -1, LeaderCommit: leaderCommitIndex}
-					rf.sendAppendEntries(i, req, &reply)
-					rf.messageCh <- &Message{Type: MsgHeartbeatResp, payload: &reply}
+					var req *AppendEntryRequest
+					if newEntries == nil {
+						req = &AppendEntryRequest{Term: term, LeaderId: rf.me, PrevLogIndex: 0, PrevLogTerm: 0, LeaderCommit: leaderCommitIndex, Entries: newEntries}
+					} else {
+						req =  &AppendEntryRequest{Term: term, LeaderId: rf.me, PrevLogIndex: prevIndex, PrevLogTerm: prevTerm, LeaderCommit: leaderCommitIndex, Entries: newEntries}
+					}
+					ok := rf.sendAppendEntries(i, req, &reply)
+					if ok {
+						rf.messageCh <- &Message{Type: MsgHeartbeatResp, payload: &reply}
+					}
 				}(i, rf.currentTerm, rf.commitIndex)
 			}
 		}
