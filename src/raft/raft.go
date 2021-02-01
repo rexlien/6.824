@@ -201,6 +201,10 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+
+	//rf.currentTerm
+	//rf.log
+	//rf
 }
 
 //
@@ -455,6 +459,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.currentLeader = -1
 
+	rf.readPersist(persister.ReadRaftState())
+
 	rf.resetElectionTimeout()
 	rf.resetPeerIndices()
 
@@ -463,6 +469,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	//ptr := uintptr(unsafe.Pointer(&rf.currentTerm))
 	//_, rf.contextLogger = WithFields(zap.Int("server", rf.me))
 	rf.logger = WithLogContext(rf.rootLoggerContext, []zapcore.Field{}...).GetSugarLogger() //rf.contextLogger
+
 
 	//rf.logger.Info("test")
 	//rf.logger.With(zap.)
@@ -824,6 +831,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 										} else {
 
 											//arrayIndex
+
+
 											interfaces := make([]interface{}, len(appendEntriesArg.Entries))
 											for i:= 0; i < len(appendEntriesArg.Entries); i++ {
 												interfaces[i] = appendEntriesArg.Entries[i]
@@ -833,9 +842,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 											//if len(rf.log) >= len(interfaces) + arrayIndex {
 											//
 											//}
-											tmpSlice := append(rf.log[0:arrayIndex+1], interfaces...)
-											rf.log = append(tmpSlice, rf.log[arrayIndex+1:len(rf.log)]...)
-											//rf.log = append(rf.log[0:arrayIndex+1], interfaces...)
+											//tmpSlice := append(rf.log[0:arrayIndex+1], interfaces...)
+											//rf.log = append(tmpSlice, rf.log[arrayIndex+1:len(rf.log)]...)
+											//TODO: check first index if consistent and discard when inconsistency is found
+											rf.log = append(rf.log[0:arrayIndex+1], interfaces...)
 
 											rf.logger.Infof("Server: %d, Append Sucessfully: %s", rf.me, rf.printLog())
 											appendEntriesReply.Success = AeEntriesAppendSuccess
@@ -855,6 +865,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 									}
 								} else {
 									//just copy from start
+									//TODO: probably not truncate
 
 									rf.log = nil
 									for i:= 0; i < len(appendEntriesArg.Entries); i++ {
@@ -883,7 +894,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 							rf.logger.Debugf("New entries Commit:%d", appendEntriesArg.LeaderCommit)
 							rf.commitIndex = appendEntriesArg.LeaderCommit
-							if rf.commitIndex >= lastIndex {
+
+							//min of last index and commit index
+							if lastIndex < rf.commitIndex  {
 								rf.commitIndex = lastIndex
 							}
 
@@ -903,7 +916,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}()
 
 	// initialize from state persisted before a crash
-	rf.readPersist(persister.ReadRaftState())
+
 
 	return rf
 }
