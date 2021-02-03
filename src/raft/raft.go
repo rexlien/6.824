@@ -853,7 +853,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 											}
 
 											appendEntriesReply.XIndex = xIndex + 1
-											rf.logger.Infof("append entries not consistent of term %d, from %d: log: %s", appendEntriesReply.XTerm, appendEntriesReply.XIndex, rf.printLog())
+											rf.logger.Debugf("append entries not consistent of term %d, from %d: log: %s", appendEntriesReply.XTerm, appendEntriesReply.XIndex, rf.printLog())
 											appendEntriesReply.Success = AeEntriesAppendFailed
 											//delete all follows it
 
@@ -877,7 +877,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 											rf.log = append(rf.log[0:arrayIndex+1], interfaces...)
 											rf.persist()
 
-											rf.logger.Infof("Server: %d, Append Sucessfully: %s", rf.me, rf.printLog())
+											rf.logger.Debugf("Server: %d, Append Sucessfully: %s", rf.me, rf.printLog())
 											appendEntriesReply.Success = AeEntriesAppendSuccess
 										}
 
@@ -889,7 +889,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 										appendEntriesReply.XIndex = -1
 										appendEntriesReply.XLen = len(rf.log)
 
-										rf.logger.Infof("prev Index not exist :%s", rf.printLog())
+										rf.logger.Debugf("prev Index not exist :%s", rf.printLog())
 										appendEntriesReply.Success = AeEntriesAppendFailed
 
 									}
@@ -902,7 +902,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 										rf.log = append(rf.log, appendEntriesArg.Entries[i])
 									}
 									rf.persist()
-									rf.logger.Infof("Server: %d, Append Sucessfully: %s", rf.me, rf.printLog())
+									rf.logger.Debugf("Server: %d, Append Sucessfully: %s", rf.me, rf.printLog())
 									appendEntriesReply.Success = AeEntriesAppendSuccess
 								}
 
@@ -1029,7 +1029,7 @@ func (rf *Raft) sendHeartbeat() {
 
 					newEntries = rf.getLogEntries(rf.nextIndex[i], -1)
 					prevIndex, _, prevTerm = rf.getLogFromIndex(rf.nextIndex[i] - 1)
-					rf.logger.Infof("Heart send new entries: %s from prev Index %d", rf.printLogEntries(newEntries), prevIndex)
+					rf.logger.Debugf("Heart send new entries: %s from prev Index %d", rf.printLogEntries(newEntries), prevIndex)
 				}
 
 				go func(i int, term int, leaderCommitIndex int) {
