@@ -18,11 +18,27 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type OpType int
+const GET OpType = 0
+const PUT OpType = 1
+const APPEND OpType = 2
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+
+	OpType OpType
+	Key string
+	Value interface{}
+
+	resultChan chan *OpResult
+
+}
+
+type OpResult struct {
+
+	result interface{}
 }
 
 type KVServer struct {
@@ -40,6 +56,25 @@ type KVServer struct {
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+
+	resultChan := make(chan *OpResult)
+	op := &Op{ OpType: GET, Key: args.Key, resultChan: resultChan }
+	_, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+	} else {
+
+		for {
+			select {
+				case _ : <-replyChan
+
+			}
+		}
+		//kv.applyCh
+	}
+
+
+
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -96,6 +131,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	go func() {
+		for {
+			select {
+			case applyMsg := <- kv.applyCh:
+				//applyMsg.Command.(*Op).replyChan <- applyMsg.Command.(*Op)
+			}
+		}
+	}()
 
 	return kv
 }
