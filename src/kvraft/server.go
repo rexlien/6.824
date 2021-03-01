@@ -38,6 +38,7 @@ type Op struct {
 
 type OpResult struct {
 
+	opType OpType
 	result interface{}
 }
 
@@ -51,6 +52,7 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	kvState map[string]interface{}
 }
 
 
@@ -66,7 +68,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 		for {
 			select {
-				case _ : <-replyChan
+				case _ := <-resultChan:
 
 			}
 		}
@@ -128,6 +130,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.kvState = make(map[string]interface{})
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
@@ -135,7 +138,16 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		for {
 			select {
 			case applyMsg := <- kv.applyCh:
-				//applyMsg.Command.(*Op).replyChan <- applyMsg.Command.(*Op)
+				op := applyMsg.Command.(*Op)
+
+				if op.OpType == GET {
+
+					op.Key
+
+				}
+
+				opResult := &OpResult{opType: op.OpType, result: nil }
+				applyMsg.Command.(*Op).resultChan <- opResult//applyMsg.Command.(*Op)
 			}
 		}
 	}()
