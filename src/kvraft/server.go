@@ -3,6 +3,7 @@ package kvraft
 import (
 	"../labgob"
 	"../labrpc"
+	"fmt"
 	"log"
 	"../raft"
 	"sync"
@@ -30,9 +31,9 @@ type Op struct {
 
 	OpType OpType
 	Key string
-	Value interface{}
+	Value string//interface{}
 
-	resultChan chan *OpResult
+	ResultChan chan *OpResult
 
 }
 
@@ -52,27 +53,32 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	kvState map[string]interface{}
+	kvState map[string]string
 }
 
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-
+	//fmt.Println("GET starts" + args.Key)
 	resultChan := make(chan *OpResult)
-	op := &Op{ OpType: GET, Key: args.Key, resultChan: resultChan }
+	op := Op{ OpType: GET, Key: args.Key, ResultChan: resultChan }
 	_, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
+
 	} else {
 
-		for {
-			select {
-				case _ := <-resultChan:
-
+		select {
+		case result := <-resultChan:
+			fmt.Println("GET Result channel")
+			if result.result == nil {
+				reply.Err = ErrNoKey
+			} else {
+				reply.Err = OK
+				reply.Value = result.result.(string)
 			}
+
 		}
-		//kv.applyCh
 	}
 
 
@@ -81,6 +87,30 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	//fmt.Println("Put Append starts")
+	resultChan := make(chan *OpResult)
+
+	var opType OpType
+	if args.Op == "Put" {
+		opType = PUT
+	} else {
+		opType = APPEND
+	}
+
+	op := Op{ OpType: opType, Key: args.Key, Value: args.Value, ResultChan: resultChan }
+	_, _, isLeader := kv.rf.Start(op)
+
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+	} else {
+
+		select {
+		case _ = <-resultChan:
+			reply.Err = OK
+		}
+
+	}
+
 }
 
 //
@@ -130,7 +160,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.kvState = make(map[string]interface{})
+	kv.kvState = make(map[string]string)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
@@ -138,16 +168,27 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		for {
 			select {
 			case applyMsg := <- kv.applyCh:
-				op := applyMsg.Command.(*Op)
 
+				fmt.Printf("apply start: %d\n", kv.me)
+				op := applyMsg.Command.(Op)
+				var result interface{} = nil
 				if op.OpType == GET {
-
-					op.Key
-
+					result = kv.kvState[op.Key]
+				} else if op.OpType == PUT {
+					kv.kvState[op.Key] = op.Value
+					result = kv.kvState[op.Key]
+				} else {
+					//append(kv.kvState[op.Key].([]string), op.Value)
+					kv.kvState[op.Key] += op.Value
+					result = kv.kvState[op.Key]
 				}
 
-				opResult := &OpResult{opType: op.OpType, result: nil }
-				applyMsg.Command.(*Op).resultChan <- opResult//applyMsg.Command.(*Op)
+				opResult := &OpResult{opType: op.OpType, result: result }
+				//fmt.Printf("start result channel")
+				if applyMsg.Command.(Op).ResultChan != nil {
+					applyMsg.Command.(Op).ResultChan <- opResult
+				}
+				fmt.Printf("apply end\n")
 			}
 		}
 	}()

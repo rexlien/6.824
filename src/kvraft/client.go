@@ -1,13 +1,16 @@
 package kvraft
 
-import "../labrpc"
+import (
+	"../labrpc"
+	"fmt"
+)
 import "crypto/rand"
 import "math/big"
 
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
-	// You will have to modify this struct.
+	// You will have to modify this struct
 }
 
 func nrand() int64 {
@@ -39,7 +42,29 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	return ""
+	args := GetArgs{Key: key}
+	reply := GetReply{}
+
+	for {
+		for _, server := range ck.servers {
+
+			ok := server.Call("KVServer.Get", &args, &reply)
+			if ok {
+				if reply.Err == OK {
+					fmt.Printf("Got Key %s: Value: %s\n", key, reply.Value)
+					return reply.Value
+				} else if reply.Err == ErrNoKey {
+					fmt.Printf("No Key\n")
+					return ""
+				} else if reply.Err == ErrWrongLeader {
+					//fmt.Println("Wrong leader")
+				}
+			} else {
+				fmt.Println("Get RPC failed")
+			}
+		}
+
+	}
 }
 
 //
@@ -54,6 +79,25 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{Key: key, Value: value, Op: op}
+	reply := PutAppendReply{}
+
+	for {
+		for _, server := range ck.servers {
+
+			ok := server.Call("KVServer.PutAppend", &args, &reply)
+			if ok {
+				if reply.Err == OK {
+					return
+				}
+			} else {
+				fmt.Println("Get RPC failed")
+			}
+		}
+
+	}
+
+
 }
 
 func (ck *Clerk) Put(key string, value string) {
