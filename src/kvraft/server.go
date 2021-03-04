@@ -3,9 +3,10 @@ package kvraft
 import (
 	"../labgob"
 	"../labrpc"
-	"fmt"
-	"log"
 	"../raft"
+	"github.com/rexlien/go-utils/xln-utils/logger"
+	"go.uber.org/zap"
+	"log"
 	"sync"
 	"sync/atomic"
 )
@@ -43,6 +44,11 @@ type OpResult struct {
 	result interface{}
 }
 
+type PutAppendRequestRecord struct {
+	requestID int32
+	reply *PutAppendReply
+}
+
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -54,6 +60,10 @@ type KVServer struct {
 
 	// Your definitions here.
 	kvState map[string]string
+
+	clientReqRecord map[int64]*PutAppendRequestRecord
+
+	logger *zap.SugaredLogger
 }
 
 
@@ -70,7 +80,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 		select {
 		case result := <-resultChan:
-			fmt.Println("GET Result channel")
+			kv.logger.Debugf("GET Result channel")
 			if result.result == nil {
 				reply.Err = ErrNoKey
 			} else {
@@ -87,7 +97,15 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
-	//fmt.Println("Put Append starts")
+	//fmt.Printf("Put Append starts: key %s, value %s", args.Key, args.Value)
+	lastRecord := kv.clientReqRecord[args.ClientID]
+	if lastRecord != nil && lastRecord.requestID == args.RequestID {
+
+		kv.logger.Debugf("Duplicated retry ignored")
+		reply.Err = lastRecord.reply.Err
+		return
+	}
+
 	resultChan := make(chan *OpResult)
 
 	var opType OpType
@@ -106,10 +124,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 		select {
 		case _ = <-resultChan:
+			kv.logger.Debugf("Put Append Result")
 			reply.Err = OK
+			kv.clientReqRecord[args.ClientID] = &PutAppendRequestRecord{requestID: args.RequestID, reply: reply}
 		}
-
 	}
+
 
 }
 
@@ -157,10 +177,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
+
+	kv.logger = logger.CreateLogContext(zap.Int("server", kv.me)).GetSugarLogger()
+
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.kvState = make(map[string]string)
+	kv.clientReqRecord = make(map[int64]*PutAppendRequestRecord)
+
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
@@ -169,8 +194,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 			select {
 			case applyMsg := <- kv.applyCh:
 
-				fmt.Printf("apply start: %d\n", kv.me)
+
 				op := applyMsg.Command.(Op)
+				kv.logger.Debugf("apply start server: %d key:%s, value:%s", kv.me, op.Key, op.Value)
 				var result interface{} = nil
 				if op.OpType == GET {
 					result = kv.kvState[op.Key]
@@ -188,7 +214,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				if applyMsg.Command.(Op).ResultChan != nil {
 					applyMsg.Command.(Op).ResultChan <- opResult
 				}
-				fmt.Printf("apply end\n")
+				kv.logger.Debugf("apply end")
 			}
 		}
 	}()
