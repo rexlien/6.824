@@ -2,15 +2,23 @@ package kvraft
 
 import (
 	"../labrpc"
-	"fmt"
+	logger "github.com/rexlien/go-utils/xln-utils/logger"
+	"go.uber.org/zap"
+	"sync/atomic"
 )
 import "crypto/rand"
 import "math/big"
 
+var nextClientID int64 = 0
 
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct
+
+	id int64
+	nextReqID int32
+
+	logger *zap.SugaredLogger
 }
 
 func nrand() int64 {
@@ -23,6 +31,10 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
+
+	ck.logger = logger.CreateLogContext().GetSugarLogger() //rf.contextLogger
+	ck.id = atomic.AddInt64(&nextClientID, 1)
+
 	// You'll have to add code here.
 	return ck
 }
@@ -42,8 +54,11 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
-	args := GetArgs{Key: key}
+
+	args := GetArgs{Key: key, }
 	reply := GetReply{}
+
+	ck.logger.Debugf("GET key staring: %s", args.Key)
 
 	for {
 		for _, server := range ck.servers {
@@ -51,16 +66,16 @@ func (ck *Clerk) Get(key string) string {
 			ok := server.Call("KVServer.Get", &args, &reply)
 			if ok {
 				if reply.Err == OK {
-					fmt.Printf("Got Key %s: Value: %s\n", key, reply.Value)
+					ck.logger.Debugf("Got Key %s: Value: %s", key, reply.Value)
 					return reply.Value
 				} else if reply.Err == ErrNoKey {
-					fmt.Printf("No Key\n")
+					ck.logger.Debugf("No Key")
 					return ""
 				} else if reply.Err == ErrWrongLeader {
 					//fmt.Println("Wrong leader")
 				}
 			} else {
-				fmt.Println("Get RPC failed")
+				ck.logger.Debugf("Get RPC failed")
 			}
 		}
 
@@ -79,19 +94,27 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-	args := PutAppendArgs{Key: key, Value: value, Op: op}
+
+	reqID := atomic.AddInt32(&ck.nextReqID, 1)
+
+	args := PutAppendArgs{Key: key, Value: value, Op: op, RequestID: reqID, ClientID: ck.id}
 	reply := PutAppendReply{}
 
-	for {
-		for _, server := range ck.servers {
 
+	for {
+		for index, server := range ck.servers {
+
+			ck.logger.Debugf("Put Append calls start: server %d, key %s, value %s", index, args.Key, args.Value)
 			ok := server.Call("KVServer.PutAppend", &args, &reply)
 			if ok {
 				if reply.Err == OK {
+					ck.logger.Debugf("Put Append End Successfully : %d", index)
 					return
+				} else {
+					ck.logger.Debugf("Put Append Failed : Wrong leader %d", index)
 				}
 			} else {
-				fmt.Println("Get RPC failed")
+				ck.logger.Debugf("PutAppend RPC failed: %d", index)
 			}
 		}
 
