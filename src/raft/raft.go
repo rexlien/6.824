@@ -648,13 +648,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 						if msg.Type == MsgAppendEntriesResp {
 
-							rf.logger.Debugf("Got MsgAppendEntriesResp")
+
 							appendEntriesMsg := msg.payload.(*AppendEntriesMessage)
+
+							rf.logger.Debugf("Got MsgAppendEntriesResp PrevIndex: %d from Server : %d", appendEntriesMsg.request.PrevLogIndex, appendEntriesMsg.toServerId)
 
 							//rf.addAppendEntriesResult(appendEntriesMsg.request.RequestID, appendEntriesMsg.reply)
 
 							if appendReply.Success == AeEntriesAppendSuccess {
-								newCommitIndex := appendEntriesMsg.request.PrevLogIndex + 1
+								newCommitIndex := appendEntriesMsg.request.PrevLogIndex + len(appendEntriesMsg.request.Entries)
 								if rf.matchIndex[appendEntriesMsg.toServerId] < newCommitIndex {
 
 									rf.matchIndex[appendEntriesMsg.toServerId] = newCommitIndex
@@ -664,9 +666,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 										//success, _ := rf.getAppendEntriesSuccessFailCount(appendEntriesMsg.request.RequestID)
 
+										//for _, match := range rf.matchIndex {
+										//	if match > n {
+									//			count++
+									//		}
+									//	}
+
 										n := rf.commitIndex
+										nextCommit := n
 										for {
 
+											if n > len(rf.log) {
+												rf.logger.Warn("commit index greater than log")
+												break
+											}
 
 											count := 0
 											for _, match := range rf.matchIndex {
@@ -675,20 +688,30 @@ func Make(peers []*labrpc.ClientEnd, me int,
 												}
 											}
 
+											if n > 1 && rf.log[n - 1].(*LogEntry).Term != rf.currentTerm {
+												//continue
+												n++
+												continue
+											}
+
 											if count >= rf.quorum - 1 {
 												n++
+												nextCommit = n
 											} else {
 												break
 											}
 
 										}
 
+										rf.logger.Debugf("next Commit index: %d", nextCommit)
+
 										//if success == rf.quorum - 1 {
-										if n > rf.commitIndex {
+										if nextCommit > rf.commitIndex {
 											//if rf.commitIndex < newCommitIndex {
 											//	rf.commitIndex = newCommitIndex
 											//}
-											rf.commitIndex = n
+											rf.logger.Debugf("Do actual commit %d", nextCommit)
+											rf.commitIndex = nextCommit
 											go func(logger *zap.SugaredLogger) {
 												/*
 												select {
@@ -697,7 +720,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 														logger.Infof("send commitCh timeout")
 												}
 */
-												logger.Infof("send commit chennel with commit Index: %d, lastApplyIndex: %d", rf.commitIndex, rf.lastApplied)
+												//logger.Infof("Trigger commit!")
 												rf.commitCh <- appendEntriesMsg
 
 											}(rf.logger)
@@ -898,7 +921,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 											rf.log = append(rf.log[0:arrayIndex+1], interfaces...)
 											rf.persist()
 
-											//rf.logger.Debugf("Server: %d, Append Sucessfully: %s", rf.me, rf.printLog())
+											rf.logger.Debugf("Server: %d, Append Sucessfully: %s", rf.me, rf.printLog())
 											appendEntriesReply.Success = AeEntriesAppendSuccess
 										}
 
@@ -984,6 +1007,15 @@ func (rf *Raft) setTerm(term int) {
 
 }
 
+func (rf *Raft) GetTerm() int {
+	defer func() {
+		rf.mu.Unlock()
+	}()
+
+	rf.mu.Lock()
+	return rf.currentTerm
+}
+
 func (rf *Raft) setLeader(id int) {
 	defer func() {
 		rf.mu.Unlock()
@@ -991,6 +1023,15 @@ func (rf *Raft) setLeader(id int) {
 
 	rf.mu.Lock()
 	rf.currentLeader = id
+}
+
+func (rf *Raft) getLeader() int {
+	defer func() {
+		rf.mu.Unlock()
+	}()
+
+	rf.mu.Lock()
+	return rf.currentLeader
 }
 
 func (rf *Raft) applyCommitted() {
@@ -1047,7 +1088,7 @@ func (rf *Raft) sendHeartbeat() {
 
 					newEntries = rf.getLogEntries(rf.nextIndex[i], -1)
 					prevIndex, _, prevTerm = rf.getLogFromIndex(rf.nextIndex[i] - 1)
-					rf.logger.Debugf("Heart send new entries: %s from prev Index %d to server: %d", rf.printLogEntries(newEntries), prevIndex, i)
+					//rf.logger.Debugf("Heart send new entries: %s from prev Index %d to server: %d", rf.printLogEntries(newEntries), prevIndex, i)
 				}
 
 				go func(i int, term int, leaderCommitIndex int) {
@@ -1067,7 +1108,7 @@ func (rf *Raft) sendHeartbeat() {
 							rf.messageCh <- &Message{Type: MsgAppendEntriesResp, payload: appendMsg}
 						}
 					} else {
-						rf.logger.Debugf("Send heartbeat failed to server: %d", i)
+						//rf.logger.Debugf("Send heartbeat failed to server: %d", i)
 					}
 				}(i, rf.currentTerm, rf.commitIndex)
 			}
@@ -1137,7 +1178,7 @@ func (rf *Raft) syncAppendEntries(doneMessage  *Message) {
 func (rf *Raft) resendAppendEntriesMessage(entries []*LogEntry, message *AppendEntriesMessage, prevIndex int, prevTerm int) {
 
 
-	rf.logger.Infof("Resend to %d append Entries from prevIndex: %d, prevTerm: %d, resend logs: %s", message.toServerId, prevIndex, prevTerm, rf.printLogEntries(entries))
+	//rf.logger.Infof("Resend to %d append Entries from prevIndex: %d, prevTerm: %d, resend logs: %s", message.toServerId, prevIndex, prevTerm, rf.printLogEntries(entries))
 
 	go func(i int, term int, leaderCommitIndex int, appendReqID int64) {
 		reply := AppendEntryReply{}
@@ -1268,10 +1309,10 @@ func (rf *Raft) printLog() string {
 func (rf *Raft) printEntries(entries []interface{}) string {
 
 	res := ""
-	for _, log := range entries {
+	for i, log := range entries {
 		logEntry := log.(*LogEntry)
 
-		res += fmt.Sprintf("[Term: %d, %+v]", logEntry.Term, logEntry.Command)
+		res += fmt.Sprintf("[Index: %d Term: %d, %+v]",i + 1  , logEntry.Term, logEntry.Command)
 	}
 
 	return res

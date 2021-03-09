@@ -9,6 +9,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const Debug = 0
@@ -61,7 +62,7 @@ type KVServer struct {
 	// Your definitions here.
 	kvState map[string]string
 
-	clientReqRecord map[int64]*PutAppendRequestRecord
+	clientReqRecord sync.Map
 
 	logger *zap.SugaredLogger
 }
@@ -72,22 +73,31 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	//fmt.Println("GET starts" + args.Key)
 	resultChan := make(chan *OpResult)
 	op := Op{ OpType: GET, Key: args.Key, ResultChan: resultChan }
-	_, _, isLeader := kv.rf.Start(op)
+	_, term, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 
 	} else {
 
-		select {
-		case result := <-resultChan:
-			kv.logger.Debugf("GET Result channel")
-			if result.result == nil {
-				reply.Err = ErrNoKey
-			} else {
-				reply.Err = OK
-				reply.Value = result.result.(string)
-			}
+		looping := true
+		for looping {
+			select {
+			case result := <-resultChan:
+				kv.logger.Debugf("GET Result channel")
+				if result.result == nil {
+					reply.Err = ErrNoKey
+				} else {
+					reply.Err = OK
+					reply.Value = result.result.(string)
+				}
+				looping = false
+			case <- time.After(3 * time.Second):
+				if term != kv.rf.GetTerm() {
+					reply.Err = ErrWrongLeader
+					looping = false
+				}
 
+			}
 		}
 	}
 
@@ -98,13 +108,17 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 	//fmt.Printf("Put Append starts: key %s, value %s", args.Key, args.Value)
-	lastRecord := kv.clientReqRecord[args.ClientID]
-	if lastRecord != nil && lastRecord.requestID == args.RequestID {
+	record, ok := kv.clientReqRecord.Load(args.ClientID)//[args.ClientID]
+	if ok {
+		lastRecord := record.(*PutAppendRequestRecord)
+		if lastRecord.requestID == args.RequestID {
 
-		kv.logger.Debugf("Duplicated retry ignored")
-		reply.Err = lastRecord.reply.Err
-		return
+			kv.logger.Debugf("Duplicated retry ignored")
+			reply.Err = lastRecord.reply.Err
+			return
+		}
 	}
+
 
 	resultChan := make(chan *OpResult)
 
@@ -116,18 +130,31 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	op := Op{ OpType: opType, Key: args.Key, Value: args.Value, ResultChan: resultChan }
-	_, _, isLeader := kv.rf.Start(op)
+	_, term, isLeader := kv.rf.Start(op)
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
 	} else {
 
-		select {
-		case _ = <-resultChan:
-			kv.logger.Debugf("Put Append Result")
-			reply.Err = OK
-			kv.clientReqRecord[args.ClientID] = &PutAppendRequestRecord{requestID: args.RequestID, reply: reply}
+		looping:= true
+		for looping  {
+			select {
+			case _ = <-resultChan:
+				kv.logger.Debugf("Put Append Result")
+				reply.Err = OK
+				kv.clientReqRecord.Store(args.ClientID, &PutAppendRequestRecord{requestID: args.RequestID, reply: reply})
+				looping = false
+
+			case <- time.After(3 * time.Second):
+				if term != kv.rf.GetTerm() {
+					reply.Err = ErrWrongLeader
+					looping = false
+				}
+			}
+
 		}
+
+
 	}
 
 
@@ -184,7 +211,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.kvState = make(map[string]string)
-	kv.clientReqRecord = make(map[int64]*PutAppendRequestRecord)
+	kv.clientReqRecord = sync.Map{} // make(map[int64]*PutAppendRequestRecord)
 
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
