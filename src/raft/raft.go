@@ -244,8 +244,8 @@ func (rf *Raft) readPersist(data []byte) bool {
 
 	 } else {
 
-	 	rf.setTerm(curTerm)
-	 	rf.setVotedFor(votedFor)
+	 	rf.setTerm(curTerm, false)
+	 	rf.setVotedFor(votedFor, false)
 		fmt.Printf("Read Persistent Term : %d, VotedFor: %d, %+v\n", curTerm, votedFor, logs)
 	   rf.log = nil
 	   for _, log := range logs {
@@ -470,7 +470,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 
 
-
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
@@ -491,7 +490,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitCh = make(chan interface{})
 	rf.appendResults = make(map[int64][]*AppendEntryReply)
 	rf.applyCh = applyCh
-	rf.votedFor = -1
+	rf.setVotedFor(-1, false)//votedFor = -1
 	rf.currentLeader = -1
 
 	rf.rootLoggerContext = CreateLogContext(zap.Int("server", rf.me))
@@ -499,6 +498,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	if !rf.readPersist(persister.ReadRaftState()) {
 		rf.logger = WithLogContext(rf.rootLoggerContext, []zapcore.Field{}...).GetSugarLogger() //rf.contextLogger
 	}
+
+	rf.logger.Debugf("Raft created")
 
 	rf.resetElectionTimeout()
 	rf.resetPeerIndices()
@@ -537,10 +538,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						rf.logger.Infof("Election timeout..Becoming candidate")
 
 						rf.state = CANDIDATE
-						rf.setTerm(rf.currentTerm + 1)
+						rf.setTerm(rf.currentTerm + 1, true)
 						rf.setLeader(-1)
 						rf.currentVoteCount = 1
-						rf.setVotedFor(rf.me)
+						rf.setVotedFor(rf.me, true)
 
 						index, _, lastTerm := rf.getLogFromLast(0)
 
@@ -572,7 +573,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						rf.logger.Infof("Election timeout, become follower")
 						rf.state = FOLLOWER
 						rf.currentVoteCount = 0
-						rf.setVotedFor(-1)
+						rf.setVotedFor(-1, true)
 
 						rf.resetElectionTimeout()
 					}
@@ -602,10 +603,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						rf.logger.Debugf("Larger term : %d vote received", voteReply.Term)
 						rf.state = FOLLOWER
 						//rf.currentTerm = voteReply.Term
-						rf.setTerm(voteReply.Term)
+						rf.setTerm(voteReply.Term, true)
 						rf.currentVoteCount = 0
 						//rf.votedFor = -1
-						rf.setVotedFor(-1)
+						rf.setVotedFor(-1, true)
 						rf.resetElectionTimeout()
 						break
 					} else if voteReply.Term == rf.currentTerm {
@@ -637,8 +638,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					if appendReply.Term > rf.currentTerm {
 
 						rf.logger.Debugf("Become follower from Appendentries")
-						rf.setTerm(appendReply.Term)
-						rf.setVotedFor(-1)
+						rf.setTerm(appendReply.Term, true)
+						rf.setVotedFor(-1, true)
 						rf.toFollower()
 						rf.setLeader(-1)
 						rf.resetElectionTimeout()
@@ -662,7 +663,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 									rf.matchIndex[appendEntriesMsg.toServerId] = newCommitIndex
 									rf.nextIndex[appendEntriesMsg.toServerId] = newCommitIndex + 1
 
-									if appendReply.Term == rf.currentTerm {
+									//if appendReply.Term == rf.currentTerm {
 
 										//success, _ := rf.getAppendEntriesSuccessFailCount(appendEntriesMsg.request.RequestID)
 
@@ -726,7 +727,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 											}(rf.logger)
 										}
 									}
-								}
+								//}
 
 								if rf.nextIndex[appendEntriesMsg.toServerId] < newCommitIndex {
 									rf.nextIndex[appendEntriesMsg.toServerId] = newCommitIndex
@@ -818,9 +819,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						}
 
 						if requestVoteArg.Term != rf.currentTerm {
-							rf.setVotedFor(-1)
+							rf.setVotedFor(-1, true)
 							//rf.currentTerm = requestVoteArg.Term
-							rf.setTerm(requestVoteArg.Term)
+							rf.setTerm(requestVoteArg.Term, true)
 						}
 						//newer Term
 						requestVoteReply.Term = rf.currentTerm
@@ -841,7 +842,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 									requestVoteReply.VoteGranted = false
 								} else {
 
-									rf.setVotedFor(requestVoteArg.CandidateId)
+									rf.setVotedFor(requestVoteArg.CandidateId, true)
 									rf.logger.Infof("Voted:%d\n", rf.votedFor)
 									requestVoteReply.VoteGranted = true
 									rf.resetElectionTimeout()
@@ -872,8 +873,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 							if rf.currentTerm != appendEntriesArg.Term {
 								//rf.logger.Debugf("Got newer term AppendEntries from Term: %d leader: %d", appendEntriesArg.Term, appendEntriesArg.LeaderId)
-								rf.setTerm(appendEntriesArg.Term)
-								rf.setVotedFor(appendEntriesArg.LeaderId)
+								rf.setTerm(appendEntriesArg.Term, true)
+								rf.setVotedFor(appendEntriesArg.LeaderId, true)
 							}
 
 							if appendEntriesArg.Entries != nil {
@@ -994,7 +995,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-func (rf *Raft) setTerm(term int) {
+func (rf *Raft) setTerm(term int, persist bool) {
 
 	defer func() {
 		rf.mu.Unlock()
@@ -1002,7 +1003,9 @@ func (rf *Raft) setTerm(term int) {
 
 	rf.mu.Lock()
 	rf.currentTerm = term
-	rf.persist()
+	if persist {
+		rf.persist()
+	}
 	rf.logger = WithLogContext(rf.rootLoggerContext, zap.Int("term", rf.currentTerm)).GetSugarLogger()
 
 }
@@ -1061,15 +1064,31 @@ func (rf *Raft) resetElectionTimeout()  {
 }
 
 func (rf *Raft) toFollower() {
+
 	rf.state = FOLLOWER
 	//rf.votedFor = -1
 	rf.currentVoteCount = 0
+
 }
 
-func (rf *Raft) setVotedFor(votedFor int) {
+func (rf *Raft) setVotedFor(votedFor int, persist bool) {
 
+	defer func() {
+		rf.mu.Unlock()
+	}()
+	rf.mu.Lock()
 	rf.votedFor = votedFor
-	rf.persist()
+	if persist {
+		rf.persist()
+	}
+}
+
+func (rf *Raft) getVotedFor() int {
+	defer func() {
+		rf.mu.Unlock()
+	}()
+	rf.mu.Lock()
+	return rf.votedFor
 }
 
 func (rf *Raft) sendHeartbeat() {
@@ -1077,7 +1096,7 @@ func (rf *Raft) sendHeartbeat() {
 	lastIndex, _, _ := rf.getLogFromLast(0)
 
 	//if rf.elapsedHeartbeatTime >= rf.heartbeatTimeout {
-		//rf.logger.Infof("Server %d Send Heartbeat\n", rf.me)
+		rf.logger.Infof("Server %d Send Heartbeat commit: %d \n", rf.me, rf.commitIndex)
 		for i := 0; i < len(rf.peers); i++ {
 			if i != rf.me {
 				var newEntries []*LogEntry
@@ -1088,7 +1107,7 @@ func (rf *Raft) sendHeartbeat() {
 
 					newEntries = rf.getLogEntries(rf.nextIndex[i], -1)
 					prevIndex, _, prevTerm = rf.getLogFromIndex(rf.nextIndex[i] - 1)
-					//rf.logger.Debugf("Heart send new entries: %s from prev Index %d to server: %d", rf.printLogEntries(newEntries), prevIndex, i)
+					rf.logger.Debugf("Heart send new entries: %s from prev Index %d to server: %d", rf.printLogEntries(newEntries), prevIndex, i)
 				}
 
 				go func(i int, term int, leaderCommitIndex int) {
