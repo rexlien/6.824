@@ -92,6 +92,10 @@ type LogEntry struct {
 
 }
 
+type NonOpCommand struct {
+
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -410,18 +414,27 @@ func (rf *Raft) Start(command interface{}) (retIndex int, retTerm int , retIsLea
 		return -1, term, false
 	} else {
 		commandMsg := &Message{Type: MsgStartCommand, payload: &StartCommand{logEntry: &LogEntry{Command: command, Term: term}}, doneChan: waitChannel}
-		rf.startCh <- commandMsg
+		go func() {
+			rf.startCh <- commandMsg
+		}()
+
+
 	}
 
-	select {
+	looping := true
+	for looping {
+		select {
 		case msg := <-waitChannel:
 			index = msg.payload.(*StartCommand).resIndex
-		case <- time.After(30* time.Second):
-			return -1, term, isLeader
+			looping = false
+		case <-time.After(3 * time.Second):
+			if rf.killed() {
+				looping = false
+			}
+
+		}
 	}
-
 	fmt.Printf("Start Return index: %d\n", index)
-
 
 	return index, term, isLeader
 }
@@ -464,6 +477,7 @@ var globalR = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 func init() {
 	gob.Register(LogEntry{})
+	gob.Register(NonOpCommand{})
 }
 
 func Make(peers []*labrpc.ClientEnd, me int,
@@ -517,18 +531,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					msg.payload.(*StartCommand).resIndex = len(rf.log)
 
 					msg.doneChan <- msg
+					rf.syncAppendEntries()
 
-
-					rf.syncAppendEntries(msg)
-					//msg.doneChan <- msg
 
 				} else {
 
 					rf.logger.Infof("Can't start: not a leader")
 					msg.payload.(*StartCommand).resIndex = -1
-					go func() {
-						msg.doneChan <- msg
-					}()
+					msg.doneChan <- msg
 				}
 			case _ = <-rf.ticker.C:
 				if rf.state == FOLLOWER {
@@ -620,8 +630,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 									rf.setLeader(rf.me)
 									rf.state = LEADER
 									rf.resetPeerIndices()
-									rf.sendHeartbeat()
 									rf.elapsedHeartbeatTime = 0
+
+									//for i, _ := range rf.nextIndex {
+									//	rf.nextIndex[i] = len(rf.log)
+									//}
+									rf.sendHeartbeat()
+
+									//go func() {
+									//	rf.Start(NonOpCommand{})
+									//}()
 								}
 							}
 						}
@@ -658,6 +676,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 							if appendReply.Success == AeEntriesAppendSuccess {
 								newCommitIndex := appendEntriesMsg.request.PrevLogIndex + len(appendEntriesMsg.request.Entries)
+								//rf.logger.Debugf("New Commit index should be : %d", newCommitIndex)
 								if rf.matchIndex[appendEntriesMsg.toServerId] < newCommitIndex {
 
 									rf.matchIndex[appendEntriesMsg.toServerId] = newCommitIndex
@@ -676,15 +695,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 										n := rf.commitIndex
 										nextCommit := n
 										for {
-
+											//rf.logger.Debugf("updating n %d...", n)
 											if n > len(rf.log) {
-												rf.logger.Warn("commit index greater than log")
+												rf.logger.Warnf("break: commit index %d greater than log length: %d", n, len(rf.log))
 												break
 											}
 
 											count := 0
 											for _, match := range rf.matchIndex {
-												if match > n {
+												if match >= n {
 													count++
 												}
 											}
@@ -696,8 +715,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 											}
 
 											if count >= rf.quorum - 1 {
-												n++
 												nextCommit = n
+												n++
 											} else {
 												break
 											}
@@ -871,7 +890,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							appendEntriesReply.Success = AeEntriesAppendFailed
 						} else {
 
-							if rf.currentTerm != appendEntriesArg.Term {
+							if appendEntriesArg.Term > rf.currentTerm  {
 								//rf.logger.Debugf("Got newer term AppendEntries from Term: %d leader: %d", appendEntriesArg.Term, appendEntriesArg.LeaderId)
 								rf.setTerm(appendEntriesArg.Term, true)
 								rf.setVotedFor(appendEntriesArg.LeaderId, true)
@@ -962,25 +981,27 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							rf.setLeader(appendEntriesArg.LeaderId)
 							rf.toFollower()
 							rf.resetElectionTimeout()
-						}
 
-						lastIndex, _ , term := rf.getLogFromLast(0)
+							lastIndex, _ , term := rf.getLogFromLast(0)
 
-						if appendEntriesArg.LeaderCommit > rf.commitIndex && term == appendEntriesArg.Term {
+							if appendEntriesArg.LeaderCommit > rf.commitIndex && appendEntriesReply.Term == term {
 
-							rf.logger.Debugf("New entries Commit:%d", appendEntriesArg.LeaderCommit)
-							rf.commitIndex = appendEntriesArg.LeaderCommit
+								rf.logger.Debugf("New entries Commit:%d", appendEntriesArg.LeaderCommit)
+								rf.commitIndex = appendEntriesArg.LeaderCommit
 
-							//min of last index and commit index
-							if lastIndex < rf.commitIndex  {
-								rf.commitIndex = lastIndex
+								//min of last index and commit index
+								if lastIndex < rf.commitIndex  {
+									rf.commitIndex = lastIndex
+								}
+
+								go func() {
+									rf.commitCh <- -1
+								}()
+
 							}
-
-							go func() {
-								rf.commitCh <- -1
-							}()
-
 						}
+
+
 						msg.doneChan <- msg
 					}
 				}
@@ -1043,11 +1064,13 @@ func (rf *Raft) applyCommitted() {
 
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			command := rf.log[i-1].(*LogEntry).Command
-			applyMsg := ApplyMsg{Command: command, CommandValid: true, CommandIndex: i}
-			rf.applyCh <- applyMsg
-
+			_, ok  := command.(*NonOpCommand)
+			if !ok {
+				applyMsg := ApplyMsg{Command: command, CommandValid: true, CommandIndex: i}
+				rf.applyCh <- applyMsg
+			}
 		}
-		rf.logger.Infof("End apply from %d to %d", rf.lastApplied, rf.commitIndex)
+		rf.logger.Infof("End apply from %d to %d", rf.lastApplied + 1, rf.commitIndex)
 		rf.lastApplied = rf.commitIndex
 	}
 }
@@ -1103,7 +1126,7 @@ func (rf *Raft) sendHeartbeat() {
 
 				prevIndex := 0
 				prevTerm := 0
-				if lastIndex >= rf.nextIndex[i] {
+				if rf.nextIndex[i] > 0 && lastIndex >= rf.nextIndex[i] {
 
 					newEntries = rf.getLogEntries(rf.nextIndex[i], -1)
 					prevIndex, _, prevTerm = rf.getLogFromIndex(rf.nextIndex[i] - 1)
@@ -1135,7 +1158,7 @@ func (rf *Raft) sendHeartbeat() {
 	//}
 }
 
-func (rf *Raft) syncAppendEntries(doneMessage  *Message) {
+func (rf *Raft) syncAppendEntries() {
 
 	lastIndex, logEntry, _ := rf.getLogFromLast(0)
 	_, _, prevTerm := rf.getLogFromLast(1)
