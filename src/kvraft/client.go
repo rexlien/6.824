@@ -35,6 +35,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.logger = logger.CreateLogContext().GetSugarLogger() //rf.contextLogger
 	ck.id = atomic.AddInt64(&nextClientID, 1)
 
+	ck.logger.Debugf("Client Created: ID, %d", ck.id)
 	// You'll have to add code here.
 	return ck
 }
@@ -54,8 +55,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Get(key string) string {
 
 	// You will have to modify this function.
+	reqID := atomic.AddInt32(&ck.nextReqID, 1)
 
-	args := GetArgs{Key: key, }
+	args := GetArgs{Key: key, RequestID: reqID, ClientID: ck.id}
 	reply := GetReply{}
 
 	ck.logger.Debugf("GET key staring: %s", args.Key)
@@ -97,21 +99,23 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 	reqID := atomic.AddInt32(&ck.nextReqID, 1)
 
-	args := PutAppendArgs{Key: key, Value: value, Op: op, RequestID: reqID, ClientID: ck.id}
-	reply := PutAppendReply{}
+	args := PutAppendArgs{Key: key, Value: value, Op: op, RequestID: reqID, ClientID: ck.id, PrevIndex: -1}
+	reply := PutAppendReply{Index: -1}
 
+	ck.logger.Debugf("Put Append calls start, key %s, value %s", args.Key, args.Value)
 
 	for {
 		for index, server := range ck.servers {
 
-			ck.logger.Debugf("Put Append calls start: server %d, key %s, value %s", index, args.Key, args.Value)
+			//ck.logger.Debugf("Put Append calls start: server %d, key %s, value %s", index, args.Key, args.Value)
 			ok := server.Call("KVServer.PutAppend", &args, &reply)
 			if ok {
 				if reply.Err == OK {
-					ck.logger.Debugf("Put Append End Successfully : %d", index)
+					ck.logger.Debugf("Put Append End Successfully : %s", value)
 					return
 				} else {
-					ck.logger.Debugf("Put Append Failed : Wrong leader %d", index)
+					//ck.logger.Debugf("Put Append Failed : Wrong leader %d", index)
+					args.PrevIndex = reply.Index
 				}
 			} else {
 				ck.logger.Debugf("PutAppend RPC failed: %d", index)
@@ -119,6 +123,8 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		}
 
 	}
+
+
 
 
 }

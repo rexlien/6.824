@@ -649,11 +649,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				} else if msg.Type == MsgHeartbeatResp || msg.Type == MsgAppendEntriesResp{
 
 					appendEntriesMsg := msg.payload.(*AppendEntriesMessage)
-
-					//appendReply, ok := msg.payload.(*AppendEntryReply)
-					//if !ok {
 					appendReply := appendEntriesMsg.reply
-					//}
 
 					if appendReply.Term > rf.currentTerm {
 
@@ -664,9 +660,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						rf.setLeader(-1)
 						rf.resetElectionTimeout()
 
-					} else {
+					} else if appendReply.Term == rf.currentTerm {
 
-
+						//if rf.state != LEADER {
+						//	break
+						//}
 						//if msg.Type == MsgAppendEntriesResp {
 
 
@@ -678,71 +676,74 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 							if appendReply.Success == AeEntriesAppendSuccess {
 								newCommitIndex := appendEntriesMsg.request.PrevLogIndex + len(appendEntriesMsg.request.Entries)
-								//rf.logger.Debugf("New Commit index should be : %d", newCommitIndex)
+								rf.logger.Debugf("New Commit index should be : %d", newCommitIndex)
 								if rf.matchIndex[appendEntriesMsg.toServerId] < newCommitIndex {
 
 									rf.matchIndex[appendEntriesMsg.toServerId] = newCommitIndex
 									rf.nextIndex[appendEntriesMsg.toServerId] = newCommitIndex + 1
 
-										n := rf.commitIndex
-										nextCommit := n
-										for {
-											//rf.logger.Debugf("updating n %d...", n)
-											if n > len(rf.log) {
-												rf.logger.Warnf("break: commit index %d greater than log length: %d", n, len(rf.log))
-												break
-											}
+								}
 
-											count := 0
-											for _, match := range rf.matchIndex {
-												if match >= n {
-													count++
-												}
-											}
+								n := rf.commitIndex
+								nextCommit := n
 
-											if n > 1 && rf.log[n - 1].(*LogEntry).Term != rf.currentTerm {
-												//continue
-												n++
-												continue
-											}
+								for {
+									rf.logger.Debugf("updating n %d...", n)
+									if n > len(rf.log) {
+										rf.logger.Warnf("break: commit index %d greater than log length: %d", n, len(rf.log))
+										break
+									}
 
-											if count >= rf.quorum - 1 {
-												nextCommit = n
-												n++
-											} else {
-												break
-											}
-
-										}
-
-										rf.logger.Debugf("next Commit index: %d", nextCommit)
-
-										//if success == rf.quorum - 1 {
-										if nextCommit > rf.commitIndex {
-											//if rf.commitIndex < newCommitIndex {
-											//	rf.commitIndex = newCommitIndex
-											//}
-											rf.logger.Debugf("Do actual commit %d", nextCommit)
-											rf.commitIndex = nextCommit
-											go func(logger *zap.SugaredLogger) {
-												/*
-												select {
-													case appendEntriesMsg.commitCh <- newCommitIndex:
-													case <- time.After(time.Second * 15):
-														logger.Infof("send commitCh timeout")
-												}
-*/
-												//logger.Infof("Trigger commit!")
-												rf.commitCh <- appendEntriesMsg
-
-											}(rf.logger)
+									count := 0
+									for _, match := range rf.matchIndex {
+										if match >= n {
+											count++
 										}
 									}
+/*
+									if n > 1 && rf.log[n-1].(*LogEntry).Term != rf.currentTerm {
+										//continue
+										rf.logger.Debugf("Skip can't commit 8c")
+										n++
+										continue
+									}
+*/
+									if count >= rf.quorum-1 {
+										nextCommit = n
+										n++
+									} else {
+										break
+									}
+
+								}
+
+								rf.logger.Debugf("next Commit index: %d", nextCommit)
+
+								//if success == rf.quorum - 1 {
+								if nextCommit > rf.commitIndex {
+									//if rf.commitIndex < newCommitIndex {
+									//	rf.commitIndex = newCommitIndex
+									//}
+									rf.logger.Debugf("Do actual commit %d", nextCommit)
+									rf.commitIndex = nextCommit
+									go func(logger *zap.SugaredLogger) {
+										/*
+											select {
+												case appendEntriesMsg.commitCh <- newCommitIndex:
+												case <- time.After(time.Second * 15):
+													logger.Infof("send commitCh timeout")
+											}
+										*/
+										//logger.Infof("Trigger commit!")
+										rf.commitCh <- appendEntriesMsg
+
+									}(rf.logger)
+								}
 								//}
 
-								if rf.nextIndex[appendEntriesMsg.toServerId] < newCommitIndex {
-									rf.nextIndex[appendEntriesMsg.toServerId] = newCommitIndex
-								}
+								//if rf.nextIndex[appendEntriesMsg.toServerId] < newCommitIndex {
+								//	rf.nextIndex[appendEntriesMsg.toServerId] = newCommitIndex
+								//}
 
 							} else if appendReply.Success == AeEntriesAppendFailed {
 
@@ -957,7 +958,30 @@ func Make(peers []*labrpc.ClientEnd, me int,
 								}
 
 							} else {
-								appendEntriesReply.Success = AeEntriesAppendSuccess
+
+								if appendEntriesArg.PrevLogIndex > 0 {
+									arrayIndex := appendEntriesArg.PrevLogIndex - 1
+									if arrayIndex < len(rf.log) {
+
+										if appendEntriesArg.PrevLogTerm != rf.log[arrayIndex].(*LogEntry).Term {
+
+											appendEntriesReply.XTerm = rf.log[arrayIndex].(*LogEntry).Term
+											xIndex := 0
+											for xIndex := arrayIndex; xIndex >= 0; xIndex-- {
+
+												if rf.log[xIndex].(*LogEntry).Term != appendEntriesReply.XTerm {
+													xIndex++
+													break
+												}
+											}
+
+											appendEntriesReply.XIndex = xIndex + 1
+											rf.logger.Debugf("append entries not consistent of term %d, from %d: log: %s", appendEntriesReply.XTerm, appendEntriesReply.XIndex, rf.printLog())
+											appendEntriesReply.Success = AeEntriesAppendFailed
+										}
+									}
+								}
+											//appendEntriesReply.Success = AeEntriesAppendSuccess
 							}
 
 
@@ -1379,4 +1403,9 @@ func (rf* Raft) getLogEntries(from int, to int) []*LogEntry{
 		entries[i] = entry.(*LogEntry)
 	}
 	return entries
+}
+
+func (rf* Raft) getLogEntry(from int, to int) *LogEntry {
+
+	return nil
 }

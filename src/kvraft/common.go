@@ -19,15 +19,20 @@ type PutAppendArgs struct {
 
 	ClientID int64
 	RequestID int32
+	PrevIndex int
 }
 
 type PutAppendReply struct {
 	Err Err
+	Index int
 }
 
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+
+	ClientID int64
+	RequestID int32
 }
 
 type GetReply struct {

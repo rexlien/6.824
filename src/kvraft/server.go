@@ -33,10 +33,11 @@ type Op struct {
 
 	OpType OpType
 	Key string
-	Value string//interface{}
+	Value string
 
-	ResultChan chan *OpResult
-
+	//ResultChan chan *OpResult
+	ClientID int64
+	ReqID int32
 }
 
 type OpResult struct {
@@ -48,6 +49,11 @@ type OpResult struct {
 type PutAppendRequestRecord struct {
 	requestID int32
 	reply *PutAppendReply
+}
+
+type GetRequestRecord struct {
+	requestID int32
+	reply *GetReply
 }
 
 type KVServer struct {
@@ -63,22 +69,65 @@ type KVServer struct {
 	kvState map[string]string
 
 	clientReqRecord sync.Map
+	getReqRecord sync.Map
+	curClientReqID sync.Map
+	clientResultChan sync.Map
+	clientResultChanMu sync.Mutex
 
 	logger *zap.SugaredLogger
+}
+
+func (kv *KVServer) getChannelMap(clientID int64) *sync.Map {
+
+	defer func() {
+		kv.clientResultChanMu.Unlock()
+	}()
+	kv.clientResultChanMu.Lock()
+	channelMap, ok := kv.clientResultChan.Load(clientID)
+	if ok {
+		return channelMap.(*sync.Map)
+	} else {
+
+		newChannelMap := &sync.Map{}
+		kv.clientResultChan.Store(clientID, newChannelMap)
+		return newChannelMap
+	}
+
+
 }
 
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
 	//fmt.Println("GET starts" + args.Key)
+
+	record, ok := kv.getReqRecord.Load(args.ClientID)
+	if ok {
+		lastRecord := record.(*GetRequestRecord)
+		if lastRecord.requestID == args.RequestID {
+
+			kv.logger.Debugf("Duplicated retry ignored")
+			reply.Value = lastRecord.reply.Value
+			reply.Err = lastRecord.reply.Err
+			return
+		}
+	}
+
+	channelMap := kv.getChannelMap(args.ClientID)
+
+	//prevChan, ok := channelMap.Load(args.RequestID)
+	//if ok {
+	//	close(prevChan.(chan *OpResult))
+	//}
+
 	resultChan := make(chan *OpResult)
-	op := Op{ OpType: GET, Key: args.Key, ResultChan: resultChan }
+	channelMap.Store(args.RequestID, resultChan)
+
+	op := Op{ OpType: GET, Key: args.Key, ClientID: args.ClientID, ReqID: args.RequestID}
 	_, term, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		reply.Err = ErrWrongLeader
-
 	} else {
-
 		looping := true
 		for looping {
 			select {
@@ -90,22 +139,27 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 					reply.Err = OK
 					reply.Value = result.result.(string)
 				}
+				kv.getReqRecord.Store(args.ClientID, &GetRequestRecord{requestID: args.RequestID, reply: reply})
 				looping = false
+				close(resultChan)
 			case <- time.After(3 * time.Second):
 				if term != kv.rf.GetTerm() {
 					reply.Err = ErrWrongLeader
 					looping = false
+					close(resultChan)
 				}
 
 			}
 		}
 	}
 
+	channelMap.Delete(args.RequestID)
+
 
 
 }
 
-func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply)  {
 	// Your code here.
 	//fmt.Printf("Put Append starts: key %s, value %s", args.Key, args.Value)
 	record, ok := kv.clientReqRecord.Load(args.ClientID)//[args.ClientID]
@@ -115,12 +169,20 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 			kv.logger.Debugf("Duplicated retry ignored")
 			reply.Err = lastRecord.reply.Err
+
 			return
 		}
 	}
 
 
+	channelMap := kv.getChannelMap(args.ClientID)
 	resultChan := make(chan *OpResult)
+
+	//prevChan, ok := channelMap.Load(args.RequestID)
+	//if ok {
+	//	close(prevChan.(chan *OpResult))
+	//}
+	channelMap.Store(args.RequestID, resultChan)
 
 	var opType OpType
 	if args.Op == "Put" {
@@ -129,8 +191,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		opType = APPEND
 	}
 
-	op := Op{ OpType: opType, Key: args.Key, Value: args.Value, ResultChan: resultChan }
-	_, term, isLeader := kv.rf.Start(op)
+	op := Op{ OpType: opType, Key: args.Key, Value: args.Value, ClientID: args.ClientID, ReqID: args.RequestID}
+	index, term, isLeader := kv.rf.Start(op)
 
 	if !isLeader {
 		reply.Err = ErrWrongLeader
@@ -140,22 +202,28 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		for looping  {
 			select {
 			case _ = <-resultChan:
-				kv.logger.Debugf("Put Append Result")
+				kv.logger.Debugf("Put Append Result: %s", args.Value)
 				reply.Err = OK
 				kv.clientReqRecord.Store(args.ClientID, &PutAppendRequestRecord{requestID: args.RequestID, reply: reply})
+				reply.Index = index
 				looping = false
+				close(resultChan)
 
 			case <- time.After(3 * time.Second):
 				if term != kv.rf.GetTerm() {
+
+					kv.logger.Warnf("Leader lossed")
 					reply.Err = ErrWrongLeader
+					reply.Index = index
+					close(resultChan)
 					looping = false
 				}
 			}
 
 		}
-
-
 	}
+
+	channelMap.Delete(args.RequestID)
 
 
 }
@@ -212,6 +280,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.kvState = make(map[string]string)
 	kv.clientReqRecord = sync.Map{} // make(map[int64]*PutAppendRequestRecord)
+	kv.curClientReqID = sync.Map{}
+	kv.clientResultChan = sync.Map{}
+	kv.getReqRecord = sync.Map{}
 
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
@@ -224,23 +295,50 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 				op := applyMsg.Command.(Op)
 				kv.logger.Debugf("apply start server: %d key:%s, value:%s", kv.me, op.Key, op.Value)
+
 				var result interface{} = nil
 				if op.OpType == GET {
 					result = kv.kvState[op.Key]
-				} else if op.OpType == PUT {
-					kv.kvState[op.Key] = op.Value
-					result = kv.kvState[op.Key]
 				} else {
-					//append(kv.kvState[op.Key].([]string), op.Value)
-					kv.kvState[op.Key] += op.Value
-					result = kv.kvState[op.Key]
-				}
 
+					reqID, ok := kv.curClientReqID.Load(op.ClientID)
+					duplicateFound := false
+					if ok && reqID == op.ReqID {
+						duplicateFound = true
+					}
+					if !duplicateFound {
+						if op.OpType == PUT {
+							kv.kvState[op.Key] = op.Value
+							result = kv.kvState[op.Key]
+						} else {
+							//append(kv.kvState[op.Key].([]string), op.Value)
+							kv.kvState[op.Key] += op.Value
+							result = kv.kvState[op.Key]
+						}
+						kv.curClientReqID.Store(op.ClientID, op.ReqID)
+					}
+				}
 				opResult := &OpResult{opType: op.OpType, result: result }
 				//fmt.Printf("start result channel")
-				if applyMsg.Command.(Op).ResultChan != nil {
-					applyMsg.Command.(Op).ResultChan <- opResult
+				channelMap, ok := kv.clientResultChan.Load(op.ClientID)
+				if  ok {
+					channel, ok := channelMap.(*sync.Map).Load(op.ReqID)
+					//go func() {
+					if ok {
+						select {
+						case channel.(chan *OpResult) <- opResult:
+							break
+						case <-time.After(200 * time.Millisecond):
+							kv.logger.Warn("result wait too long")
+						}
+					}
+					//channelMap.(*sync.Map).Delete(op.ReqID)
+					//close(channel.(chan *OpResult))
+					//}
 				}
+					//}()
+					//}
+
 				kv.logger.Debugf("apply end")
 			}
 		}
