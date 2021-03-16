@@ -682,63 +682,57 @@ func Make(peers []*labrpc.ClientEnd, me int,
 									rf.matchIndex[appendEntriesMsg.toServerId] = newCommitIndex
 									rf.nextIndex[appendEntriesMsg.toServerId] = newCommitIndex + 1
 
-								}
+									n := rf.commitIndex
+									nextCommit := n
 
-								n := rf.commitIndex
-								nextCommit := n
-
-								for {
-									rf.logger.Debugf("updating n %d...", n)
-									if n > len(rf.log) {
-										rf.logger.Warnf("break: commit index %d greater than log length: %d", n, len(rf.log))
-										break
-									}
-
-									count := 0
-									for _, match := range rf.matchIndex {
-										if match >= n {
-											count++
+									for {
+										//rf.logger.Debugf("updating n %d...", n)
+										if n > len(rf.log) {
+											rf.logger.Warnf("break: commit index %d greater than log length: %d", n, len(rf.log))
+											break
 										}
-									}
-/*
-									if n > 1 && rf.log[n-1].(*LogEntry).Term != rf.currentTerm {
-										//continue
-										rf.logger.Debugf("Skip can't commit 8c")
-										n++
-										continue
-									}
-*/
-									if count >= rf.quorum-1 {
-										nextCommit = n
-										n++
-									} else {
-										break
-									}
 
-								}
-
-								rf.logger.Debugf("next Commit index: %d", nextCommit)
-
-								//if success == rf.quorum - 1 {
-								if nextCommit > rf.commitIndex {
-									//if rf.commitIndex < newCommitIndex {
-									//	rf.commitIndex = newCommitIndex
-									//}
-									rf.logger.Debugf("Do actual commit %d", nextCommit)
-									rf.commitIndex = nextCommit
-									go func(logger *zap.SugaredLogger) {
-										/*
-											select {
-												case appendEntriesMsg.commitCh <- newCommitIndex:
-												case <- time.After(time.Second * 15):
-													logger.Infof("send commitCh timeout")
+										count := 0
+										for _, match := range rf.matchIndex {
+											if match >= n {
+												count++
 											}
-										*/
-										//logger.Infof("Trigger commit!")
-										rf.commitCh <- appendEntriesMsg
+										}
 
-									}(rf.logger)
+											if n > 1 && rf.log[n-1].(*LogEntry).Term != rf.currentTerm {
+												//continue
+												rf.logger.Debugf("Skip can't commit 8c Index %d:", n)
+												n++
+												continue
+											}
+
+										if count >= rf.quorum-1 {
+											nextCommit = n
+											n++
+										} else {
+											break
+										}
+
+									}
+
+									rf.logger.Debugf("next Commit index: %d", nextCommit)
+
+									//if success == rf.quorum - 1 {
+									if nextCommit > rf.commitIndex {
+
+										rf.logger.Debugf("Do actual commit %d", nextCommit)
+										rf.commitIndex = nextCommit
+										go func(logger *zap.SugaredLogger) {
+
+											//logger.Infof("Trigger commit!")
+											rf.commitCh <- appendEntriesMsg
+
+										}(rf.logger)
+									}
+
 								}
+
+
 								//}
 
 								//if rf.nextIndex[appendEntriesMsg.toServerId] < newCommitIndex {
@@ -749,14 +743,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 								if rf.state == LEADER && appendEntriesMsg.request.Term == rf.currentTerm {
 									rf.logger.Infof("append entry false from Server: %d", appendEntriesMsg.toServerId)
-									//newPrev := appendEntriesMsg.request.PrevLogIndex - 1
-									//if newPrev >= 0 {
 
-										//_, _, term = rf.getLogFromIndex(newPrev)
-
-
-
-									//}
 									if appendEntriesMsg.reply.XTerm == -1 {
 
 										rf.nextIndex[appendEntriesMsg.toServerId] = appendEntriesMsg.reply.XLen + 1
@@ -775,6 +762,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 										rf.logger.Debugf("Term recovery from Term :%d, Index :%d", appendEntriesMsg.reply.Term, appendEntriesMsg.reply.XIndex)
 										rf.nextIndex[appendEntriesMsg.toServerId] = appendEntriesMsg.reply.XIndex
+
+										//to previous array index
 										newPrev := appendEntriesMsg.reply.XIndex - 2
 										if newPrev < 0 {
 											newPrev = 0
@@ -904,9 +893,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 											}
 
 											appendEntriesReply.XIndex = xIndex + 1
-											rf.logger.Debugf("append entries not consistent of term %d, from %d: log: %s", appendEntriesReply.XTerm, appendEntriesReply.XIndex, rf.printLog())
+											//rf.logger.Debugf("append entries not consistent of term %d, from %d: log: %s", appendEntriesReply.XTerm, appendEntriesReply.XIndex, rf.printLog())
 											appendEntriesReply.Success = AeEntriesAppendFailed
-											//delete all follows it
 
 										} else {
 
@@ -925,10 +913,43 @@ func Make(peers []*labrpc.ClientEnd, me int,
 											//tmpSlice := append(rf.log[0:arrayIndex+1], interfaces...)
 											//rf.log = append(tmpSlice, rf.log[arrayIndex+1:len(rf.log)]...)
 											//TODO: check first index if consistent and discard when inconsistency is found
-											rf.log = append(rf.log[0:arrayIndex+1], interfaces...)
+											//rf.log = append(rf.log[0:arrayIndex+1], interfaces...)
+
+
+
+											mergedArrayLength := arrayIndex + 1 + len(interfaces)
+
+											//original log is more complete, mostly can ignore but but check need to discard
+											if len(rf.log) > mergedArrayLength {
+
+												rf.logger.Debugf("current array longer then merged array : %d, Merged array: %d", len(rf.log), mergedArrayLength)
+												replaceLog := rf.log[arrayIndex:len(rf.log)]
+
+												conflictFound := false
+												for i := len(interfaces) - 1; i >= 0; i-- {
+
+													if i < len(replaceLog) && interfaces[i].(*LogEntry).Term != replaceLog[i].(*LogEntry).Term {
+														conflictFound = true
+													}
+
+												}
+												if conflictFound {
+													//discard
+													rf.log = append(rf.log[0:arrayIndex+1], interfaces...)
+													rf.logger.Debugf("[Log] Conflict update, %s", rf.printLog())
+												} else {
+													rf.logger.Debugf("[Log] Outdated update!!!!!!!!!!!!!!!!!!!!!!!!!! Non conflict ignore: %s", rf.printLog())
+													//rf.log = append(rf.log[0:arrayIndex+1], interfaces...)
+													//rf.log = append()
+												}
+
+											} else {
+												rf.log = append(rf.log[0:arrayIndex+1], interfaces...)
+											}
+
 											rf.persist()
 
-											rf.logger.Debugf("Server: %d, Append Sucessfully: %s", rf.me, rf.printLog())
+											//rf.logger.Debugf("Server: %d, Append Sucessfully: %s", rf.me, rf.printLog())
 											appendEntriesReply.Success = AeEntriesAppendSuccess
 										}
 
@@ -953,7 +974,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 										rf.log = append(rf.log, appendEntriesArg.Entries[i])
 									}
 									rf.persist()
-									rf.logger.Debugf("Server: %d, Append Sucessfully: %s", rf.me, rf.printLog())
+									rf.logger.Debugf("[Log] Server: %d, Copy from start sucessfully: %s", rf.me, rf.printLog())
 									appendEntriesReply.Success = AeEntriesAppendSuccess
 								}
 
@@ -976,7 +997,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 											}
 
 											appendEntriesReply.XIndex = xIndex + 1
-											rf.logger.Debugf("append entries not consistent of term %d, from %d: log: %s", appendEntriesReply.XTerm, appendEntriesReply.XIndex, rf.printLog())
+											//rf.logger.Debugf("append entries not consistent of term %d, from %d: log: %s", appendEntriesReply.XTerm, appendEntriesReply.XIndex, rf.printLog())
 											appendEntriesReply.Success = AeEntriesAppendFailed
 										}
 									}
@@ -994,7 +1015,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 							lastIndex, _ , term := rf.getLogFromLast(0)
 
-							if appendEntriesArg.LeaderCommit > rf.commitIndex && appendEntriesReply.Term == term {
+							if appendEntriesArg.LeaderCommit > rf.commitIndex && appendEntriesReply.Success == AeEntriesAppendSuccess && appendEntriesReply.Term == term {
 
 								rf.logger.Debugf("New entries Commit:%d", appendEntriesArg.LeaderCommit)
 								rf.commitIndex = appendEntriesArg.LeaderCommit
@@ -1129,7 +1150,7 @@ func (rf *Raft) sendHeartbeat() {
 	lastIndex, _, lastTerm := rf.getLogFromLast(0)
 
 	//if rf.elapsedHeartbeatTime >= rf.heartbeatTimeout {
-		rf.logger.Infof("Server %d Send Heartbeat commit: %d \n", rf.me, rf.commitIndex)
+		//rf.logger.Infof("Server %d Send Heartbeat commit: %d \n", rf.me, rf.commitIndex)
 		for i := 0; i < len(rf.peers); i++ {
 			if i != rf.me {
 				var newEntries []*LogEntry
@@ -1140,7 +1161,7 @@ func (rf *Raft) sendHeartbeat() {
 
 					newEntries = rf.getLogEntries(rf.nextIndex[i], -1)
 					prevIndex, _, prevTerm = rf.getLogFromIndex(rf.nextIndex[i] - 1)
-					rf.logger.Debugf("Heart send new entries: %s from prev Index %d to server: %d", rf.printLogEntries(newEntries), prevIndex, i)
+					//rf.logger.Debugf("Heart send new entries: %s from prev Index %d to server: %d", rf.printLogEntries(newEntries), prevIndex, i)
 				}
 
 				go func(i int, term int, leaderCommitIndex int) {

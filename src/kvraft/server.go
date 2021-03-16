@@ -74,6 +74,10 @@ type KVServer struct {
 	clientResultChan sync.Map
 	clientResultChanMu sync.Mutex
 
+	clientMutexMapMu sync.Mutex
+	clientMutexMap sync.Map
+
+
 	logger *zap.SugaredLogger
 }
 
@@ -96,10 +100,26 @@ func (kv *KVServer) getChannelMap(clientID int64) *sync.Map {
 
 }
 
+func (kv *KVServer) getClientMutex(clientID int64) *sync.Mutex {
+
+	mutex, ok := kv.clientMutexMap.Load(clientID)
+	if ok {
+		return mutex.(*sync.Mutex)
+	} else {
+
+		defer func() {
+			kv.clientMutexMapMu.Unlock()
+		}()
+		kv.clientMutexMapMu.Lock()
+		newMutex := &sync.Mutex{}
+		kv.clientMutexMap.Store(clientID, newMutex)
+		return newMutex
+	}
+}
+
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
-	//fmt.Println("GET starts" + args.Key)
 
 	record, ok := kv.getReqRecord.Load(args.ClientID)
 	if ok {
@@ -113,12 +133,12 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		}
 	}
 
+	defer func() {
+		kv.getClientMutex(args.ClientID).Unlock()
+	}()
+	kv.getClientMutex(args.ClientID).Lock()
 	channelMap := kv.getChannelMap(args.ClientID)
 
-	//prevChan, ok := channelMap.Load(args.RequestID)
-	//if ok {
-	//	close(prevChan.(chan *OpResult))
-	//}
 
 	resultChan := make(chan *OpResult)
 	channelMap.Store(args.RequestID, resultChan)
@@ -141,12 +161,13 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 				}
 				kv.getReqRecord.Store(args.ClientID, &GetRequestRecord{requestID: args.RequestID, reply: reply})
 				looping = false
-				close(resultChan)
-			case <- time.After(3 * time.Second):
+				//close(resultChan)
+			case <- time.After(1 * time.Second):
 				if term != kv.rf.GetTerm() {
+					kv.logger.Warnf("Leader lossed")
 					reply.Err = ErrWrongLeader
 					looping = false
-					close(resultChan)
+					//close(resultChan)
 				}
 
 			}
@@ -161,7 +182,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply)  {
 	// Your code here.
-	//fmt.Printf("Put Append starts: key %s, value %s", args.Key, args.Value)
+
 	record, ok := kv.clientReqRecord.Load(args.ClientID)//[args.ClientID]
 	if ok {
 		lastRecord := record.(*PutAppendRequestRecord)
@@ -174,14 +195,14 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply)  {
 		}
 	}
 
+	defer func() {
+		kv.getClientMutex(args.ClientID).Unlock()
+	}()
+	kv.getClientMutex(args.ClientID).Lock()
 
 	channelMap := kv.getChannelMap(args.ClientID)
 	resultChan := make(chan *OpResult)
 
-	//prevChan, ok := channelMap.Load(args.RequestID)
-	//if ok {
-	//	close(prevChan.(chan *OpResult))
-	//}
 	channelMap.Store(args.RequestID, resultChan)
 
 	var opType OpType
@@ -207,15 +228,15 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply)  {
 				kv.clientReqRecord.Store(args.ClientID, &PutAppendRequestRecord{requestID: args.RequestID, reply: reply})
 				reply.Index = index
 				looping = false
-				close(resultChan)
+				//close(resultChan)
 
-			case <- time.After(3 * time.Second):
+			case <- time.After(1 * time.Second):
 				if term != kv.rf.GetTerm() {
 
 					kv.logger.Warnf("Leader lossed")
 					reply.Err = ErrWrongLeader
 					reply.Index = index
-					close(resultChan)
+					//close(resultChan)
 					looping = false
 				}
 			}
@@ -275,6 +296,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.logger = logger.CreateLogContext(zap.Int("server", kv.me)).GetSugarLogger()
 
+
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
@@ -283,6 +305,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.curClientReqID = sync.Map{}
 	kv.clientResultChan = sync.Map{}
 	kv.getReqRecord = sync.Map{}
+
+	kv.clientMutexMap = sync.Map{}
 
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
@@ -294,7 +318,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 
 				op := applyMsg.Command.(Op)
-				kv.logger.Debugf("apply start server: %d key:%s, value:%s", kv.me, op.Key, op.Value)
+				//kv.logger.Debugf("apply start server: %d key:%s, value:%s", kv.me, op.Key, op.Value)
 
 				var result interface{} = nil
 				if op.OpType == GET {
@@ -320,26 +344,28 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				}
 				opResult := &OpResult{opType: op.OpType, result: result }
 				//fmt.Printf("start result channel")
+
 				channelMap, ok := kv.clientResultChan.Load(op.ClientID)
-				if  ok {
+				if ok {
 					channel, ok := channelMap.(*sync.Map).Load(op.ReqID)
 					//go func() {
 					if ok {
 						select {
 						case channel.(chan *OpResult) <- opResult:
 							break
-						case <-time.After(200 * time.Millisecond):
-							kv.logger.Warn("result wait too long")
+						case <-time.After(1000 * time.Millisecond):
+							kv.logger.Warn("result wait too long, must be leader changed")
 						}
 					}
 					//channelMap.(*sync.Map).Delete(op.ReqID)
 					//close(channel.(chan *OpResult))
 					//}
 				}
-					//}()
+
+				//}()
 					//}
 
-				kv.logger.Debugf("apply end")
+				//kv.logger.Debugf("apply end")
 			}
 		}
 	}()

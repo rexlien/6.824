@@ -32,7 +32,9 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 
-	ck.logger = logger.CreateLogContext().GetSugarLogger() //rf.contextLogger
+	ctx := logger.CreateLogContext()
+	//ctx.GetConfig().Level.SetLevel()
+	ck.logger = ctx.GetSugarLogger() //rf.contextLogger
 	ck.id = atomic.AddInt64(&nextClientID, 1)
 
 	ck.logger.Debugf("Client Created: ID, %d", ck.id)
@@ -77,7 +79,7 @@ func (ck *Clerk) Get(key string) string {
 					//fmt.Println("Wrong leader")
 				}
 			} else {
-				ck.logger.Debugf("Get RPC failed")
+				//ck.logger.Debugf("Get RPC failed")
 			}
 		}
 
@@ -105,7 +107,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	ck.logger.Debugf("Put Append calls start, key %s, value %s", args.Key, args.Value)
 
 	for {
-		for index, server := range ck.servers {
+		for _, server := range ck.servers {
 
 			//ck.logger.Debugf("Put Append calls start: server %d, key %s, value %s", index, args.Key, args.Value)
 			ok := server.Call("KVServer.PutAppend", &args, &reply)
@@ -118,7 +120,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 					args.PrevIndex = reply.Index
 				}
 			} else {
-				ck.logger.Debugf("PutAppend RPC failed: %d", index)
+				//ck.logger.Debugf("PutAppend RPC failed: %d", index)
 			}
 		}
 
