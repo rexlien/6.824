@@ -1,0 +1,3 @@
+[submodule "src/go-utils"]
+	path = src/go-utils
+	url = https://github.com/rexlien/go-utils.git
