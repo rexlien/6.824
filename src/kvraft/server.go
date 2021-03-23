@@ -111,9 +111,16 @@ func (kv *KVServer) getClientMutex(clientID int64) *sync.Mutex {
 			kv.clientMutexMapMu.Unlock()
 		}()
 		kv.clientMutexMapMu.Lock()
-		newMutex := &sync.Mutex{}
-		kv.clientMutexMap.Store(clientID, newMutex)
-		return newMutex
+		mutex, ok := kv.clientMutexMap.Load(clientID)
+		if !ok {
+
+			newMutex := &sync.Mutex{}
+			kv.clientMutexMap.Store(clientID, newMutex)
+			return newMutex
+		} else {
+			return mutex.(*sync.Mutex)
+		}
+
 	}
 }
 

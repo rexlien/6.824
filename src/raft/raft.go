@@ -29,7 +29,7 @@ import (
 )
 import "sync/atomic"
 import "../labrpc"
-
+import "../go-utils/xln-utils/raft"
 // import "bytes"
 import "../labgob"
 
@@ -62,7 +62,7 @@ type RequestPair struct {
 }
 
 type StartCommand struct {
-	logEntry *LogEntry
+	logEntry *raft.LogEntry
 	resIndex int
 
 
@@ -84,14 +84,14 @@ type ApplyMsg struct {
 	Command      interface{}
 	CommandIndex int
 }
-
+/*
 type LogEntry struct {
 
 	Command interface{}
 	Term int
 
 }
-
+*/
 type NonOpCommand struct {
 
 }
@@ -112,7 +112,7 @@ type Raft struct {
 
 	//persisted
 	currentTerm int
-	log         []interface{}
+	//log         []interface{}
 	votedFor    int
 
 	//volatile
@@ -154,6 +154,8 @@ type Raft struct {
 	rootLoggerContext *LogContext// *zap.SugaredLogger
 	//loggerContext *LogContext
 	logger *zap.SugaredLogger
+
+	logs *raft.Logs
 }
 
 type Message struct {
@@ -212,7 +214,11 @@ func (rf *Raft) persist() {
 	if err != nil {
 		rf.logger.Fatalf("persist error: %s", err.Error())
 	}
-	err = e.Encode(rf.log)
+	err = e.Encode(rf.logs.Offset)//e.Encode(rf.logs.Log)
+	if err != nil {
+		rf.logger.Fatalf("persist error: %s", err.Error())
+	}
+	err = e.Encode(rf.logs.Log)//e.Encode(rf.logs.Log)
 	if err != nil {
 		rf.logger.Fatalf("persist error: %s", err.Error())
 	}
@@ -238,10 +244,12 @@ func (rf *Raft) readPersist(data []byte) bool {
 
 	curTerm := 0
 	votedFor := 0
-	logs := make([]interface{}, 0)
+	offset := 0
+	logs := make([]*raft.LogEntry, 0)
 
 	if d.Decode(&curTerm) != nil ||
 	    d.Decode(&votedFor) != nil ||
+		d.Decode(&offset) != nil ||
 		d.Decode(&logs) != nil {
 
 		panic("read persist failed")
@@ -251,11 +259,14 @@ func (rf *Raft) readPersist(data []byte) bool {
 	 	rf.setTerm(curTerm, false)
 	 	rf.setVotedFor(votedFor, false)
 		fmt.Printf("Read Persistent Term : %d, VotedFor: %d, %+v\n", curTerm, votedFor, logs)
-	   rf.log = nil
+	    rf.logs.Offset = offset
+	 	rf.logs.Clear()
+
 	   for _, log := range logs {
 
-		   logEntry := log.(LogEntry)
-	   		rf.log = append(rf.log, &logEntry)
+		   //logEntry := log.(raft.LogEntry)
+	   		rf.logs.AppendEntries(log)
+		   //rf.log = append(rf.log, &logEntry)
 	   }
 	 }
 
@@ -312,7 +323,7 @@ type AppendEntryRequest struct {
 	LeaderId int
 	PrevLogIndex int
 	PrevLogTerm int
-	Entries []*LogEntry
+	Entries []*raft.LogEntry
 	LeaderCommit int
 
 }
@@ -413,7 +424,7 @@ func (rf *Raft) Start(command interface{}) (retIndex int, retTerm int , retIsLea
 	if !isLeader {
 		return -1, term, false
 	} else {
-		commandMsg := &Message{Type: MsgStartCommand, payload: &StartCommand{logEntry: &LogEntry{Command: command, Term: term}}, doneChan: waitChannel}
+		commandMsg := &Message{Type: MsgStartCommand, payload: &StartCommand{logEntry: &raft.LogEntry{Command: command, Term: term}}, doneChan: waitChannel}
 		go func() {
 			rf.startCh <- commandMsg
 		}()
@@ -476,7 +487,7 @@ var rMutex = sync.Mutex{}
 var globalR = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 func init() {
-	gob.Register(LogEntry{})
+	gob.Register(raft.LogEntry{})
 	gob.Register(NonOpCommand{})
 }
 
@@ -488,7 +499,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.log = make([]interface{}, 0)
+	//rf.log = make([]interface{}, 0)
+	rf.logs = raft.NewLogs()
+
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 
@@ -527,8 +540,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 					rf.logger.Infof("Start a new aggrement %+v", msg.payload.(*StartCommand).logEntry)
 					logEntry := msg.payload.(*StartCommand).logEntry
-					rf.log = append(rf.log, logEntry)
-					msg.payload.(*StartCommand).resIndex = len(rf.log)
+					//rf.log = append(rf.log, logEntry)
+					rf.logs.AppendEntries(logEntry)
+					msg.payload.(*StartCommand).resIndex = rf.logs.Len()//len(rf.log)
 
 					msg.doneChan <- msg
 					rf.syncAppendEntries()
@@ -553,7 +567,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						rf.currentVoteCount = 1
 						rf.setVotedFor(rf.me, true)
 
-						index, _, lastTerm := rf.getLogFromLast(0)
+						index, _, lastTerm := rf.logs.GetLogFromLast(0)
 
 						for i := 0; i < len(peers); i++ {
 							if i != rf.me {
@@ -687,8 +701,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 									for {
 										//rf.logger.Debugf("updating n %d...", n)
-										if n > len(rf.log) {
-											rf.logger.Warnf("break: commit index %d greater than log length: %d", n, len(rf.log))
+										if n > rf.logs.Len() {
+											rf.logger.Warnf("break: commit index %d greater than log length: %d", n, rf.logs.Len())
 											break
 										}
 
@@ -699,7 +713,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 											}
 										}
 
-											if n > 1 && rf.log[n-1].(*LogEntry).Term != rf.currentTerm {
+											if n > 1 && rf.logs.GetEntry(n-1).Term != rf.currentTerm {
 												//continue
 												rf.logger.Debugf("Skip can't commit 8c Index %d:", n)
 												n++
@@ -751,9 +765,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 										newPrev := appendEntriesMsg.reply.XLen
 										newPrevTerm := 0
 										if newPrev > 0 {
-											newPrevTerm = rf.log[newPrev - 1].(*LogEntry).Term
+											newPrevTerm = rf.logs.GetEntry(newPrev - 1).Term
 										}
-										entries := rf.getLogEntries(newPrev + 1, -1)
+										entries := rf.logs.GetLogEntries(newPrev + 1, -1)
 
 										rf.resendAppendEntriesMessage(entries, appendEntriesMsg, newPrev, newPrevTerm)
 										//appendEntriesMsg.toServerId
@@ -768,8 +782,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 										if newPrev < 0 {
 											newPrev = 0
 										}
-										newPrevTerm := rf.log[newPrev].(*LogEntry).Term
-										entries := rf.getLogEntries(newPrev + 1, -1)
+										newPrevTerm := rf.logs.GetEntry(newPrev).Term
+										entries := rf.logs.GetLogEntries(newPrev + 1, -1)
 
 										rf.resendAppendEntriesMessage(entries, appendEntriesMsg, newPrev, newPrevTerm)
 									}
@@ -824,7 +838,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						if rf.votedFor == -1 || rf.votedFor == requestVoteArg.CandidateId {
 							//rf.votedFor = requestVoteArg.CandidateId
 
-							index, _, term := rf.getLogFromLast(0)
+							index, _, term := rf.logs.GetLogFromLast(0)
 
 							if requestVoteArg.LastLogTerm < term {
 								rf.logger.Infof("reject vote to %d, due to outdated term", requestVoteArg.CandidateId)
@@ -878,15 +892,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 								if appendEntriesArg.PrevLogIndex > 0 {
 
 									arrayIndex := appendEntriesArg.PrevLogIndex - 1
-									if arrayIndex < len(rf.log) {
+									if arrayIndex < rf.logs.Len() {
 
-										if appendEntriesArg.PrevLogTerm != rf.log[arrayIndex].(*LogEntry).Term {
+										if appendEntriesArg.PrevLogTerm != rf.logs.GetEntry(arrayIndex).Term {
 
-											appendEntriesReply.XTerm = rf.log[arrayIndex].(*LogEntry).Term
+											appendEntriesReply.XTerm = rf.logs.GetEntry(arrayIndex).Term
 											xIndex := 0
 											for xIndex := arrayIndex; xIndex >= 0; xIndex-- {
 
-												if rf.log[xIndex].(*LogEntry).Term != appendEntriesReply.XTerm {
+												if rf.logs.GetEntry(xIndex).Term != appendEntriesReply.XTerm {
 													xIndex++
 													break
 												}
@@ -900,12 +914,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 											//arrayIndex
 
-
+/*
 											interfaces := make([]interface{}, len(appendEntriesArg.Entries))
 											for i:= 0; i < len(appendEntriesArg.Entries); i++ {
 												interfaces[i] = appendEntriesArg.Entries[i]
 											}
-
+*/
 
 											//if len(rf.log) >= len(interfaces) + arrayIndex {
 											//
@@ -917,34 +931,35 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 
 
-											mergedArrayLength := arrayIndex + 1 + len(interfaces)
+											mergedArrayLength := arrayIndex + 1 + len(appendEntriesArg.Entries)
 
 											//original log is more complete, mostly can ignore but but check need to discard
-											if len(rf.log) > mergedArrayLength {
+											if rf.logs.Len() > mergedArrayLength {
 
-												rf.logger.Debugf("current array longer then merged array : %d, Merged array: %d", len(rf.log), mergedArrayLength)
-												replaceLog := rf.log[arrayIndex:len(rf.log)]
+												rf.logger.Debugf("current array longer then merged array : %d, Merged array: %d", rf.logs.Len(), mergedArrayLength)
+												replaceLog := rf.logs.GetEntriesFrom(arrayIndex + 1)//log[arrayIndex:len(rf.log)]
 
 												conflictFound := false
-												for i := len(interfaces) - 1; i >= 0; i-- {
+												for i := len(appendEntriesArg.Entries) - 1; i >= 0; i-- {
 
-													if i < len(replaceLog) && interfaces[i].(*LogEntry).Term != replaceLog[i].(*LogEntry).Term {
+													if i < len(replaceLog) && appendEntriesArg.Entries[i].Term != replaceLog[i].Term {
 														conflictFound = true
 													}
 
 												}
 												if conflictFound {
 													//discard
-													rf.log = append(rf.log[0:arrayIndex+1], interfaces...)
-													rf.logger.Debugf("[Log] Conflict update, %s", rf.printLog())
-												} else {
-													rf.logger.Debugf("[Log] Outdated update!!!!!!!!!!!!!!!!!!!!!!!!!! Non conflict ignore: %s", rf.printLog())
 													//rf.log = append(rf.log[0:arrayIndex+1], interfaces...)
-													//rf.log = append()
+													rf.logs.ReplaceEntriesFrom(appendEntriesArg.Entries, arrayIndex+1, true)
+													rf.logger.Debugf("[Log] Conflict update, %s", rf.logs.ToString())
+												} else {
+													rf.logger.Debugf("[Log] Outdated update!!!!!!!!!!!!!!!!!!!!!!!!!! Non conflict ignore: %s", rf.logs.ToString())
+
 												}
 
 											} else {
-												rf.log = append(rf.log[0:arrayIndex+1], interfaces...)
+												//rf.log = append(rf.log[0:arrayIndex+1], interfaces...)
+												rf.logs.ReplaceEntriesFrom(appendEntriesArg.Entries, arrayIndex+1, true)
 											}
 
 											rf.persist()
@@ -959,9 +974,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 										//prev index is empty
 										appendEntriesReply.XTerm = -1
 										appendEntriesReply.XIndex = -1
-										appendEntriesReply.XLen = len(rf.log)
+										appendEntriesReply.XLen = rf.logs.Len()
 
-										rf.logger.Debugf("prev Index not exist :%s", rf.printLog())
+										rf.logger.Debugf("prev Index not exist :%s", rf.logs.ToString())
 										appendEntriesReply.Success = AeEntriesAppendFailed
 
 									}
@@ -969,12 +984,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 									//just copy from start
 									//TODO: probably not truncate
 
-									rf.log = nil
-									for i:= 0; i < len(appendEntriesArg.Entries); i++ {
-										rf.log = append(rf.log, appendEntriesArg.Entries[i])
-									}
+									rf.logs.Clear()//log = nil
+									//for i:= 0; i < len(appendEntriesArg.Entries); i++ {
+										//rf.log = append(rf.log, appendEntriesArg.Entries[i])
+									//}
+									rf.logs.AppendEntries(appendEntriesArg.Entries...)
 									rf.persist()
-									rf.logger.Debugf("[Log] Server: %d, Copy from start sucessfully: %s", rf.me, rf.printLog())
+									rf.logger.Debugf("[Log] Server: %d, Copy from start sucessfully: %s", rf.me, rf.logs.ToString())
 									appendEntriesReply.Success = AeEntriesAppendSuccess
 								}
 
@@ -982,15 +998,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 								if appendEntriesArg.PrevLogIndex > 0 {
 									arrayIndex := appendEntriesArg.PrevLogIndex - 1
-									if arrayIndex < len(rf.log) {
+									if arrayIndex < rf.logs.Len() {
 
-										if appendEntriesArg.PrevLogTerm != rf.log[arrayIndex].(*LogEntry).Term {
+										if appendEntriesArg.PrevLogTerm != rf.logs.GetEntry(arrayIndex).Term {
 
-											appendEntriesReply.XTerm = rf.log[arrayIndex].(*LogEntry).Term
+											appendEntriesReply.XTerm = rf.logs.GetEntry(arrayIndex).Term
 											xIndex := 0
 											for xIndex := arrayIndex; xIndex >= 0; xIndex-- {
 
-												if rf.log[xIndex].(*LogEntry).Term != appendEntriesReply.XTerm {
+												if rf.logs.GetEntry(arrayIndex).Term != appendEntriesReply.XTerm {
 													xIndex++
 													break
 												}
@@ -1013,7 +1029,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							rf.toFollower()
 							rf.resetElectionTimeout()
 
-							lastIndex, _ , term := rf.getLogFromLast(0)
+							lastIndex, _ , term := rf.logs.GetLogFromLast(0)
 
 							if appendEntriesArg.LeaderCommit > rf.commitIndex && appendEntriesReply.Success == AeEntriesAppendSuccess && appendEntriesReply.Term == term {
 
@@ -1094,7 +1110,7 @@ func (rf *Raft) applyCommitted() {
 	if rf.lastApplied < rf.commitIndex {
 
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-			command := rf.log[i-1].(*LogEntry).Command
+			command := rf.logs.GetEntry(i-1).Command
 			_, ok  := command.(*NonOpCommand)
 			if !ok {
 				applyMsg := ApplyMsg{Command: command, CommandValid: true, CommandIndex: i}
@@ -1147,20 +1163,20 @@ func (rf *Raft) getVotedFor() int {
 
 func (rf *Raft) sendHeartbeat() {
 
-	lastIndex, _, lastTerm := rf.getLogFromLast(0)
+	lastIndex, _, lastTerm := rf.logs.GetLogFromLast(0)
 
 	//if rf.elapsedHeartbeatTime >= rf.heartbeatTimeout {
 		//rf.logger.Infof("Server %d Send Heartbeat commit: %d \n", rf.me, rf.commitIndex)
 		for i := 0; i < len(rf.peers); i++ {
 			if i != rf.me {
-				var newEntries []*LogEntry
+				var newEntries []*raft.LogEntry
 
 				prevIndex := 0
 				prevTerm := 0
 				if lastIndex >= rf.nextIndex[i] {
 
-					newEntries = rf.getLogEntries(rf.nextIndex[i], -1)
-					prevIndex, _, prevTerm = rf.getLogFromIndex(rf.nextIndex[i] - 1)
+					newEntries = rf.logs.GetLogEntries(rf.nextIndex[i], -1)
+					prevIndex, _, prevTerm = rf.logs.GetLogFromIndex(rf.nextIndex[i] - 1)
 					//rf.logger.Debugf("Heart send new entries: %s from prev Index %d to server: %d", rf.printLogEntries(newEntries), prevIndex, i)
 				}
 
@@ -1192,14 +1208,14 @@ func (rf *Raft) sendHeartbeat() {
 
 func (rf *Raft) syncAppendEntries() {
 
-	lastIndex, logEntry, _ := rf.getLogFromLast(0)
-	_, _, prevTerm := rf.getLogFromLast(1)
+	lastIndex, logEntry, _ := rf.logs.GetLogFromLast(0)
+	_, _, prevTerm := rf.logs.GetLogFromLast(1)///getLogFromLast(1)
 
 	appendReqID := atomic.AddInt64(&rf.appendReqID, 1)
 	//leaderCommit := rf.commitIndex
 	//rf.createAppendEntriesResultEntry(appendReqID)
 
-	rf.logger.Debugf("send Append Entries, Leader logs are:%s", rf.printLog() )
+	rf.logger.Debugf("send Append Entries, Leader logs are:%s", rf.logs.ToString() )
 
 	rf.persist()
 	//commitCh := make(chan int)
@@ -1209,7 +1225,7 @@ func (rf *Raft) syncAppendEntries() {
 				rf.logger.Debugf("Send Server %d from lastIndex: %d, nextIndex: %d", i, lastIndex, rf.nextIndex[i])
 				go func(i int, term int, index int, leaderCommitIndex int, appendReqID int64) {
 					reply := AppendEntryReply{}
-					entries := make([]*LogEntry, 1)
+					entries := make([]*raft.LogEntry, 1)
 					entries[0] = logEntry
 					req := &AppendEntryRequest{RequestID: appendReqID, Term: term, LeaderId: rf.me, PrevLogIndex: lastIndex - 1, PrevLogTerm: prevTerm, LeaderCommit: leaderCommitIndex, Entries: entries}
 					//req := &AppendEntryRequest{Term: term, LeaderId: rf.me, PrevLogIndex: 0, PrevLogTerm: -1, LeaderCommit: 0}
@@ -1249,7 +1265,7 @@ func (rf *Raft) syncAppendEntries() {
 }
 
 
-func (rf *Raft) resendAppendEntriesMessage(entries []*LogEntry, message *AppendEntriesMessage, prevIndex int, prevTerm int) {
+func (rf *Raft) resendAppendEntriesMessage(entries []*raft.LogEntry, message *AppendEntriesMessage, prevIndex int, prevTerm int) {
 
 
 	//rf.logger.Infof("Resend to %d append Entries from prevIndex: %d, prevTerm: %d, resend logs: %s", message.toServerId, prevIndex, prevTerm, rf.printLogEntries(entries))
@@ -1271,162 +1287,11 @@ func (rf *Raft) resendAppendEntriesMessage(entries []*LogEntry, message *AppendE
 func (rf *Raft) resetPeerIndices() {
 
 	for i:= 0; i < len(rf.nextIndex); i++ {
-		rf.nextIndex[i] = len(rf.log) + 1
+		rf.nextIndex[i] = rf.logs.Len() + 1
 	}
 	for i:= 0; i < len(rf.matchIndex); i++ {
 		rf.matchIndex[i] = 0
 	}
 
 }
-/*
-func (rf *Raft) getLastLog() (int, *LogEntry) {
 
-	len := len(rf.log)
-	var last *LogEntry = nil
-
-	if len > 0 {
-		last = rf.log[len - 1].(*LogEntry)
-	}
-	return len, last
-
-}
-*/
-func (rf *Raft) getLogFromLast(offset int) (int, *LogEntry, int) {
-
-	len := len(rf.log)
-	index := len - offset - 1
-	term := 0
-	var result *LogEntry = nil
-
-	if index >= 0 {
-		result = rf.log[index].(*LogEntry)
-		if result != nil {
-			term = result.Term
-		}
-	}
-	return index + 1, result, term
-
-}
-
-func (rf *Raft) getLogFromIndex(index int) (int, *LogEntry, int) {
-
-	if index <= 0 {
-		return 0, nil, 0
-	}
-
-	len := len(rf.log)
-	term := 0
-	index--
-	var result *LogEntry = nil
-
-	if index < len {
-		result = rf.log[index].(*LogEntry)
-		if result != nil {
-			term = result.Term
-		}
-	}
-	return index + 1, result, term
-
-}
-
-
-/*
-func (rf *Raft) createAppendEntriesResultEntry(id int64) {
-
-	//rf.appendResultsMu.Lock()
-	rf.appendResults[id] = make([]*AppendEntryReply, 0)
-}
-
-func (rf *Raft) addAppendEntriesResult(id int64, reply *AppendEntryReply) {
-
-	if rf.appendResults[id] != nil {
-		rf.appendResults[id] = append(rf.appendResults[id], reply)
-	}
-
-}
-
-func (rf *Raft) getAppendEntriesSuccessFailCount(id int64) (int, int) {
-
-	results := rf.appendResults[id]
-	success := 0
-	fail := 0
-	for _, result := range results {
-		if result.Success == AeEntriesAppendSuccess {
-			success++
-		} else {
-			fail++
-		}
-
-	}
-	return success, fail
-
-}
-
-func (rf *Raft) cleanAppendEntriesResult(id int64) {
-
-	rf.appendResults[id] = nil
-}
-*/
-func (rf *Raft) printLog() string {
-
-	/*
-	res := ""
-	for _, log := range rf.log {
-		logEntry := log.(*LogEntry)
-
-		res += fmt.Sprintf("[Term: %d, %+v]", logEntry.Term, logEntry.Command)
-	}
-*/
-	return rf.printEntries(rf.log)
-}
-
-func (rf *Raft) printEntries(entries []interface{}) string {
-
-	res := ""
-	for i, log := range entries {
-		logEntry := log.(*LogEntry)
-
-		res += fmt.Sprintf("[Index: %d Term: %d, %+v]",i + 1  , logEntry.Term, logEntry.Command)
-	}
-
-	return res
-}
-
-func (rf *Raft) printLogEntries(entries []*LogEntry) string {
-
-	res := ""
-	for _, log := range entries {
-		res += fmt.Sprintf("[Term: %d, %+v]", log.Term, log.Command)
-	}
-
-	return res
-}
-
-func (rf *Raft) getEntries(from int, to int) []interface{} {
-
-	from = from - 1
-
-	if to == -1 {
-		to = len(rf.log)
-	} else {
-		to = to - 1
-	}
-	slice := rf.log[from: to ]
-	return slice
-}
-
-func (rf* Raft) getLogEntries(from int, to int) []*LogEntry{
-
-	slice := rf.getEntries(from, to)
-
-	entries := make([]*LogEntry, len(slice))
-	for i, entry :=  range slice {
-		entries[i] = entry.(*LogEntry)
-	}
-	return entries
-}
-
-func (rf* Raft) getLogEntry(from int, to int) *LogEntry {
-
-	return nil
-}
