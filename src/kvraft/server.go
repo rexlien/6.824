@@ -4,6 +4,7 @@ import (
 	"../labgob"
 	"../labrpc"
 	"../raft"
+	xlnraft "../go-utils/xln-utils/raft"
 	"github.com/rexlien/go-utils/xln-utils/logger"
 	"go.uber.org/zap"
 	"log"
@@ -66,7 +67,10 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	kvState map[string]string
+	//kvState map[string]string
+	kv *xlnraft.StringKV
+	ticker *time.Ticker
+
 
 	clientReqRecord sync.Map
 	getReqRecord sync.Map
@@ -307,29 +311,29 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
-	kv.kvState = make(map[string]string)
+	kv.kv = xlnraft.NewStringKV()//make(map[string]string)
 	kv.clientReqRecord = sync.Map{} // make(map[int64]*PutAppendRequestRecord)
 	kv.curClientReqID = sync.Map{}
 	kv.clientResultChan = sync.Map{}
 	kv.getReqRecord = sync.Map{}
 
 	kv.clientMutexMap = sync.Map{}
+	kv.ticker = time.NewTicker(5000 * time.Millisecond)
 
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-	go func() {
-		for {
+	go func(maxRaftState int) {
+		for !kv.killed() {
 			select {
+			case <- time.After(10 * time.Millisecond):
+				break
 			case applyMsg := <- kv.applyCh:
-
-
 				op := applyMsg.Command.(Op)
 				//kv.logger.Debugf("apply start server: %d key:%s, value:%s", kv.me, op.Key, op.Value)
-
 				var result interface{} = nil
 				if op.OpType == GET {
-					result = kv.kvState[op.Key]
+					result = kv.kv.KV[op.Key]
 				} else {
 
 					reqID, ok := kv.curClientReqID.Load(op.ClientID)
@@ -339,12 +343,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 					}
 					if !duplicateFound {
 						if op.OpType == PUT {
-							kv.kvState[op.Key] = op.Value
-							result = kv.kvState[op.Key]
+							kv.kv.KV[op.Key] = op.Value
+							result = kv.kv.KV[op.Key]
 						} else {
 							//append(kv.kvState[op.Key].([]string), op.Value)
-							kv.kvState[op.Key] += op.Value
-							result = kv.kvState[op.Key]
+							kv.kv.KV[op.Key] += op.Value
+							result = kv.kv.KV[op.Key]
 						}
 						kv.curClientReqID.Store(op.ClientID, op.ReqID)
 					}
@@ -364,18 +368,29 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 							kv.logger.Warn("result wait too long, must be leader changed")
 						}
 					}
-					//channelMap.(*sync.Map).Delete(op.ReqID)
-					//close(channel.(chan *OpResult))
-					//}
 				}
 
-				//}()
-					//}
+				currentSize := persister.RaftStateSize()
 
+				if maxraftstate != -1 && currentSize >= maxRaftState {
+
+					bytes := kv.kv.Encode()
+					snapShotIndex := applyMsg.CommandIndex
+					kv.logger.Warnf("Start snapshot from index: %d Size: %d / %d", snapShotIndex, currentSize, maxraftstate)
+
+					doneChannel := make(chan *raft.Message)
+
+					kv.rf.Snapshot(bytes, snapShotIndex, doneChannel)
+
+					_ = <-doneChannel
+
+				}
 				//kv.logger.Debugf("apply end")
 			}
+
+
 		}
-	}()
+	}(kv.maxraftstate)
 
 	return kv
 }
