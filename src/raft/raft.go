@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"encoding/gob"
 	"fmt"
+	"github.com/davecgh/go-spew/spew"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"math/rand"
@@ -49,6 +50,8 @@ const MsgHeartbeatResp MessageType = 4
 const MsgCommitted MessageType = 5
 const MsgRequestDone MessageType = 6
 const MsgTakeSnapShot MessageType = 7
+const MsgInstallSnapshot MessageType = 8
+const MsgInstallSnapshotResp MessageType = 9
 
 
 type AEResult int
@@ -69,12 +72,100 @@ type StartCommand struct {
 
 type CommitMsg struct {
 	commitIndex int
-	raftStateSize int
+	//raftStateSize int
+	snapshot *Snapshot
+	doneCh chan *CommitMsg
 }
 
-type SnapShotMsg struct {
-	snapShot []byte
-	ssIndex int
+type SnapshotMsg struct {
+	snapshot *Snapshot
+
+}
+
+type AppendEntryRequest struct {
+
+	RequestID int64
+
+	Term int
+	LeaderId int
+	PrevLogIndex int
+	PrevLogTerm int
+	Entries []*raft.LogEntry
+	LeaderCommit int
+
+}
+
+type AppendEntryReply struct {
+
+	XTerm int
+	XIndex int
+	XLen int
+
+
+	Term int
+	Success AEResult
+}
+
+//
+// example RequestVote RPC arguments structure.
+// field names must start with capital letters!
+//
+type RequestVoteArgs struct {
+	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+//
+// example RequestVote RPC reply structure.
+// field names must start with capital letters!
+//
+type RequestVoteReply struct {
+	// Your data here (2A).
+	Term        int
+	VoteGranted bool
+}
+
+type InstallSnapshotRequest struct {
+	Term int
+	LeaderID int
+	LastIncludedIndex int
+	LastIncludedTerm int
+	Offset int
+	Data []byte
+	Done bool
+}
+
+type InstallSnapshotReply struct {
+
+	Term int
+}
+
+
+type Message struct {
+	Type    MessageType
+	payload interface{}
+
+	doneChan chan *Message
+}
+
+type AppendEntriesMessage struct {
+
+	toServerId int
+	request *AppendEntryRequest
+	reply *AppendEntryReply
+
+}
+
+type InstallSnapshotMessage struct {
+
+	toServerId int
+	snapshotIndex int
+	request *InstallSnapshotRequest
+	reply *InstallSnapshotReply
+
 }
 
 //
@@ -93,17 +184,8 @@ type ApplyMsg struct {
 	Command      interface{}
 	CommandIndex int
 }
-/*
-type LogEntry struct {
 
-	Command interface{}
-	Term int
 
-}
-*/
-type NonOpCommand struct {
-
-}
 
 //
 // A Go object implementing a single Raft peer.
@@ -140,7 +222,8 @@ type Raft struct {
 	messageCh chan *Message
 	receiveChan chan *Message
 	applyCh chan ApplyMsg
-	commitCh chan int
+	commitCh chan *CommitMsg
+	//snapshotCh chan
 
 	appendResultsMu sync.Mutex
 	appendResults map[int64][]*AppendEntryReply
@@ -167,23 +250,6 @@ type Raft struct {
 	logs *raft.Logs
 }
 
-type Message struct {
-	Type    MessageType
-	payload interface{}
-
-	doneChan chan *Message
-}
-
-type AppendEntriesMessage struct {
-
-	toServerId int
-	request *AppendEntryRequest
-	reply *AppendEntryReply
-	//doneMessage *Message
-
-	//commitCh chan int
-	//commitWaiter sync.WaitGroup
-}
 
 // return currentTerm and whether this server
 // believes it is the leader.
@@ -233,7 +299,7 @@ func (rf *Raft) encodeState() []byte {
 	if err != nil {
 		rf.logger.Fatalf("persist error: %s", err.Error())
 	}
-	err = e.Encode(rf.logs.Offset)//e.Encode(rf.logs.Log)
+	err = e.Encode(rf.logs.Offset())//e.Encode(rf.logs.Log)
 	if err != nil {
 		rf.logger.Fatalf("persist error: %s", err.Error())
 	}
@@ -244,6 +310,23 @@ func (rf *Raft) encodeState() []byte {
 	data := w.Bytes()
 	return data
 
+}
+
+func (rf *Raft) encodeLog() []byte {
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	err := e.Encode(rf.logs.Offset())//e.Encode(rf.logs.Log)
+	if err != nil {
+		rf.logger.Fatalf("persist error: %s", err.Error())
+	}
+	err = e.Encode(rf.logs.Log)//e.Encode(rf.logs.Log)
+	if err != nil {
+		rf.logger.Fatalf("persist error: %s", err.Error())
+	}
+	data := w.Bytes()
+	return data
 }
 
 //
@@ -275,7 +358,7 @@ func (rf *Raft) readPersist(data []byte) bool {
 	 	rf.setTerm(curTerm, false)
 	 	rf.setVotedFor(votedFor, false)
 		fmt.Printf("Read Persistent Term : %d, VotedFor: %d, %+v\n", curTerm, votedFor, logs)
-	    rf.logs.Offset = offset
+	    rf.logs.SetOffset(offset)
 	 	rf.logs.Clear()
 
 	   for _, log := range logs {
@@ -289,27 +372,7 @@ func (rf *Raft) readPersist(data []byte) bool {
 	 return true
 }
 
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-	Term         int
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
-}
 
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
-type RequestVoteReply struct {
-	// Your data here (2A).
-	Term        int
-	VoteGranted bool
-}
 
 //
 // example RequestVote RPC handler.
@@ -331,29 +394,20 @@ func (rf *Raft) AppendEntries(args *AppendEntryRequest, reply *AppendEntryReply)
 	req = <- req.doneChan
 }
 
-type AppendEntryRequest struct {
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotRequest, reply *InstallSnapshotReply) {
 
-	RequestID int64
 
-	Term int
-	LeaderId int
-	PrevLogIndex int
-	PrevLogTerm int
-	Entries []*raft.LogEntry
-	LeaderCommit int
+	rf.logger.Debugf("recieved install snapshot")
+	req := &Message{MsgInstallSnapshot,&RequestPair{args, reply}, make(chan *Message)}
+	rf.receiveChan <- req
+	req = <- req.doneChan
+
 
 }
 
-type AppendEntryReply struct {
-
-	XTerm int
-	XIndex int
-	XLen int
 
 
-	Term int
-	Success AEResult
-}
+
 
 
 //
@@ -395,6 +449,12 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntryRequest, reply *AppendEntryReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) installSnapshot(server int, args *InstallSnapshotRequest, reply *InstallSnapshotReply) bool {
+
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
 
@@ -505,7 +565,7 @@ var globalR = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 func init() {
 	gob.Register(raft.LogEntry{})
-	gob.Register(NonOpCommand{})
+	//gob.Register(NonOpCommand{})
 }
 
 func Make(peers []*labrpc.ClientEnd, me int,
@@ -531,7 +591,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.messageCh = make(chan *Message)
 	rf.receiveChan = make(chan *Message)
 	rf.startCh = make(chan* Message)
-	rf.commitCh = make(chan int)
+	rf.commitCh = make(chan *CommitMsg)
 	rf.appendResults = make(map[int64][]*AppendEntryReply)
 	rf.applyCh = applyCh
 	rf.setVotedFor(-1, false)//votedFor = -1
@@ -633,14 +693,41 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 				}
 			case msg := <-rf.messageCh:
-				if msg.Type == MsgTakeSnapShot {
+				if msg.Type == MsgInstallSnapshotResp {
 
-					snapshotMsg := msg.payload.(*SnapShotMsg)
+					installMsg := msg.payload.(*InstallSnapshotMessage)
+					if installMsg.reply.Term > rf.currentTerm {
+						rf.logger.Debugf("Become follower from installSnapshot")
+						rf.setTerm(installMsg.reply.Term, true)
+						rf.setVotedFor(-1, true)
+						rf.toFollower()
+						rf.setLeader(-1)
+						rf.resetElectionTimeout()
 
-					if rf.logs.DiscardBefore(snapshotMsg.ssIndex) {
-						state := rf.encodeState()
-						rf.persister.SaveStateAndSnapshot(state, snapshotMsg.snapShot)
+					} else {
+
+						rf.logger.Debugf("snapshot install received with index %d", installMsg.snapshotIndex)
+						if rf.nextIndex[installMsg.toServerId] < installMsg.snapshotIndex {
+							rf.nextIndex[installMsg.toServerId] = installMsg.snapshotIndex
+						}
+
 					}
+
+
+				} else if msg.Type == MsgTakeSnapShot {
+
+					snapshotMsg := msg.payload.(*SnapshotMsg)
+
+					ok, logSnap, includeTerm := rf.logs.SnapShot(snapshotMsg.snapshot.SnapshotIndex)
+
+					if ok {
+						state := rf.encodeState()
+						snapshotMsg.snapshot.Log = logSnap
+						snapshotMsg.snapshot.SnapshotTerm = includeTerm
+						snapShotByte := snapshotMsg.snapshot.Encode()
+						rf.persister.SaveStateAndSnapshot(state, snapShotByte)
+					}
+					msg.doneChan <- msg
 
 				} else if msg.Type == MsgSentRequestVote {
 					//if rf.state == CANDIDATE {
@@ -736,7 +823,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 											}
 										}
 
-											if n > rf.logs.FirstIndex() && rf.logs.GetEntry(n-1).Term != rf.currentTerm {
+											if n > rf.logs.Offset() && rf.logs.GetEntry(n-1).Term != rf.currentTerm {
 												//continue
 												rf.logger.Debugf("Skip can't commit 8c Index %d:", n)
 												n++
@@ -762,7 +849,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 										go func(logger *zap.SugaredLogger) {
 
 											//logger.Infof("Trigger commit!")
-											rf.commitCh <- rf.commitIndex
+											rf.commitCh <- &CommitMsg{commitIndex: rf.commitIndex}
 
 										}(rf.logger)
 									}
@@ -779,7 +866,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							} else if appendReply.Success == AeEntriesAppendFailed {
 
 								if rf.state == LEADER && appendEntriesMsg.request.Term == rf.currentTerm {
-									rf.logger.Infof("append entry false from Server: %d", appendEntriesMsg.toServerId)
+
+
+									rf.logger.Info(spew.Sprintf("append entry false : %#v", appendEntriesMsg))
 
 									//if follower has empty index, send from follower's length
 									//TODO : check install snapshot
@@ -821,13 +910,37 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						//}
 					}
 				}
-				//case _ = <-rf.commitCh:
-				//	rf.logger.Debugf("Committed received")
-			//		rf.applyCommitted()
 
 				case msg := <-rf.receiveChan:
 
-					if msg.Type == MsgReceiveRequest {
+					if msg.Type == MsgInstallSnapshot {
+
+						request := msg.payload.(*RequestPair).request.(*InstallSnapshotRequest)
+						reply := msg.payload.(*RequestPair).reply.(*InstallSnapshotReply)
+
+						if rf.state == LEADER {
+							rf.logger.Warnf("Leader should not install snapshot")
+							msg.doneChan <- msg
+							break
+						}
+						if request.Term < rf.currentTerm {
+							reply.Term = rf.currentTerm
+							rf.logger.Infof("Install sansp shot ignored due to outdated term: %d -> %d", request.Term, rf.currentTerm)
+							msg.doneChan <- msg
+							break
+						}
+
+						rf.logger.Debugf("Install snapshot!")
+						//Do install
+						doneChan := make(chan *CommitMsg)
+						snapshot := NewSnapshot(request.Data)
+						rf.commitCh <- &CommitMsg{snapshot: snapshot, doneCh: doneChan, commitIndex: snapshot.SnapshotIndex}
+						_ = <-doneChan
+
+
+
+
+					} else if msg.Type == MsgReceiveRequest {
 						reqPair := msg.payload.(*RequestPair)
 						if requestVoteArg, _ := reqPair.request.(*RequestVoteArgs); requestVoteArg != nil {
 
@@ -931,13 +1044,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 												//TODO: check first index if consistent and discard when inconsistency is found
 												//rf.log = append(rf.log[0:arrayIndex+1], interfaces...)
-
-												mergedArrayIndex := logIndex + len(appendEntriesArg.Entries)
+												mergedIndex := logIndex + len(appendEntriesArg.Entries)
 
 												//original log is more complete, mostly can ignore but but check need to discard
-												if rf.logs.LastIndex() > mergedArrayIndex {
+												if rf.logs.LastIndex() > mergedIndex {
 
-													rf.logger.Debugf("current array index longer then merged index: current :%d, Merged array index: %d", rf.logs.LastIndex(), mergedArrayIndex)
+													rf.logger.Debugf("current array index longer then merged index: current :%d, Merged array index: %d", rf.logs.LastIndex(), mergedIndex)
 													replaceLog := rf.logs.GetEntriesFromByIndex(logIndex) //log[arrayIndex:len(rf.log)]
 
 													conflictFound := false
@@ -960,8 +1072,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 												} else {
 													//rf.log = append(rf.log[0:arrayIndex+1], interfaces...)
-													rf.logger.Debugf("[Log] conflict update, %s", rf.logs.ToString())
+
 													rf.logs.ReplaceEntriesFrom(appendEntriesArg.Entries, logIndex, true)
+													rf.logger.Debugf("[Log] conflict update, %s", rf.logs.ToString())
 												}
 
 												rf.persist()
@@ -1020,6 +1133,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 												//rf.logger.Debugf("append entries not consistent of term %d, from %d: log: %s", appendEntriesReply.XTerm, appendEntriesReply.XIndex, rf.printLog())
 												appendEntriesReply.Success = AeEntriesAppendFailed
 											}
+										} else {
+											//appendEntriesReply.XTerm = -1
+											//appendEntriesReply.XIndex = -1
+											//appendEntriesReply.XLen = rf.logs.Len()
+
+											//rf.logger.Debugf("prev Index not exist :%s", rf.logs.ToString())
+											//appendEntriesReply.Success = AeEntriesAppendFailed
 										}
 									}
 									//appendEntriesReply.Success = AeEntriesAppendSuccess
@@ -1043,10 +1163,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 									if lastIndex < rf.commitIndex {
 										rf.commitIndex = lastIndex
 									}
+									rf.logger.Debugf("send commit, commit index:%d", rf.commitIndex)
 
-									go func() {
-										rf.commitCh <- rf.commitIndex
-									}()
+									go func(commitIndex int) {
+										rf.commitCh <- &CommitMsg{commitIndex: commitIndex}
+									}(rf.commitIndex)
 
 								}
 							}
@@ -1063,9 +1184,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		for !rf.killed() {
 			select {
 				//WWcase
-				case commitIndex := <-rf.commitCh:
+				case commitMsg := <-rf.commitCh:
 					rf.logger.Debugf("Committed received")
-					rf.applyCommitted(commitIndex)
+					//if it's not a snap shot commit
+					if commitMsg.snapshot == nil {
+						rf.applyCommitted(commitMsg.commitIndex)
+					} else {
+						rf.logger.Debugf("Applying snapshot")
+						rf.applySnapshot(commitMsg.snapshot)
+					}
+					if commitMsg.doneCh != nil {
+						commitMsg.doneCh <- commitMsg
+					}
 			}
 		}
 	}()
@@ -1121,16 +1251,24 @@ func (rf *Raft) applyCommitted(commitIndex int) {
 
 		for i := rf.lastApplied + 1; i <= commitIndex; i++ {
 			command := rf.logs.GetEntry(i-1).Command
-			_, ok  := command.(*NonOpCommand)
-			if !ok {
-				applyMsg := ApplyMsg{Command: command, CommandValid: true, CommandIndex: i}
-				rf.applyCh <- applyMsg
-			}
+
+			applyMsg := ApplyMsg{Command: command, CommandValid: true, CommandIndex: i}
+			rf.applyCh <- applyMsg
+
 		}
 		rf.logger.Infof("End apply from %d to %d", rf.lastApplied + 1, rf.commitIndex)
 		rf.lastApplied = commitIndex
 	}
 }
+
+func (rf *Raft) applySnapshot(snapShot *Snapshot) {
+
+
+	applyMsg := ApplyMsg{Command: snapShot, CommandValid: false, CommandIndex: snapShot.SnapshotIndex}
+	rf.applyCh <- applyMsg
+	rf.lastApplied = snapShot.SnapshotIndex
+}
+
 
 func (rf *Raft) resetElectionTimeout()  {
 
@@ -1181,37 +1319,70 @@ func (rf *Raft) sendHeartbeat() {
 			if i != rf.me {
 				var newEntries []*raft.LogEntry
 
-				prevIndex, _, prevTerm := rf.logs.FirstEntry() //rf.logs.Offset
-				//prevTerm :=
-				if lastIndex >= rf.nextIndex[i] {
+				prevIndex, _, prevTerm := rf.logs.PrevEntry(rf.logs.FirstIndex())
+				rf.logger.Debugf("firstIndex: %d, nextIndex: %d for server: %d", prevIndex, rf.nextIndex[i], i)
 
-					newEntries = rf.logs.GetEntriesByIndex(rf.nextIndex[i], -1)
-					prevIndex, _, prevTerm = rf.logs.GetEntryByIndex(rf.nextIndex[i] - 1)
+				//if already snapshot from follower's next index, should send install snapshot
+				if rf.nextIndex[i] <= prevIndex {
 
-				}
+					rf.logger.Debugf("install Snaphost for server: %d", i)
+					go func(i int, leaderID int, term int, data []byte) {
 
-				go func(i int, term int, leaderCommitIndex int) {
-					reply := AppendEntryReply{}
-					var req *AppendEntryRequest
-					if newEntries == nil {
-						req = &AppendEntryRequest{Term: term, LeaderId: rf.me, PrevLogIndex: lastIndex, PrevLogTerm: lastTerm, LeaderCommit: leaderCommitIndex, Entries: newEntries}
-					} else {
-						req =  &AppendEntryRequest{Term: term, LeaderId: rf.me, PrevLogIndex: prevIndex, PrevLogTerm: prevTerm, LeaderCommit: leaderCommitIndex, Entries: newEntries}
-					}
-					rf.logger.Debugf("Heart send new append message: %+v to server: %d", req, i)
-					ok := rf.sendAppendEntries(i, req, &reply)
-					if ok {
-						if newEntries == nil {
-							appendMsg := &AppendEntriesMessage{request: req, reply: &reply, toServerId: i}
-							rf.messageCh <- &Message{Type: MsgHeartbeatResp, payload: appendMsg}
+						req := &InstallSnapshotRequest{}
+						reply := InstallSnapshotReply{}
+
+						snapshot := NewSnapshot(data)
+
+
+						req.LeaderID = leaderID
+						req.Term = term
+						req.LastIncludedIndex = snapshot.SnapshotIndex
+						req.LastIncludedTerm = snapshot.SnapshotTerm
+						req.Done = true
+						req.Offset = 0
+						req.Data = data
+
+
+						ok := rf.installSnapshot(i, req, &reply)
+						if ok {
+							rf.logger.Debugf("Install snapshot succeeded!!!")
+							rf.messageCh <- &Message{Type: MsgInstallSnapshotResp, payload: &InstallSnapshotMessage{request: req, reply: &reply, toServerId: i, snapshotIndex: prevIndex}}
 						} else {
-							appendMsg := &AppendEntriesMessage{request: req, reply: &reply, toServerId: i}
-							rf.messageCh <- &Message{Type: MsgAppendEntriesResp, payload: appendMsg}
+							rf.logger.Debugf("Install snapshot rpc failed!")
 						}
-					} else {
-						//rf.logger.Debugf("Send heartbeat failed to server: %d", i)
+					}(i, rf.me, rf.currentTerm, rf.persister.ReadSnapshot())
+
+
+				} else {
+					if lastIndex >= rf.nextIndex[i] {
+
+						newEntries = rf.logs.GetEntriesByIndex(rf.nextIndex[i], -1)
+						prevIndex, _, prevTerm = rf.logs.GetEntryByIndex(rf.nextIndex[i] - 1)
 					}
-				}(i, rf.currentTerm, rf.commitIndex)
+
+					go func(i int, term int, leaderCommitIndex int) {
+						reply := AppendEntryReply{}
+						var req *AppendEntryRequest
+						if newEntries == nil {
+							req = &AppendEntryRequest{Term: term, LeaderId: rf.me, PrevLogIndex: lastIndex, PrevLogTerm: lastTerm, LeaderCommit: leaderCommitIndex, Entries: newEntries}
+						} else {
+							req = &AppendEntryRequest{Term: term, LeaderId: rf.me, PrevLogIndex: prevIndex, PrevLogTerm: prevTerm, LeaderCommit: leaderCommitIndex, Entries: newEntries}
+						}
+						rf.logger.Debugf("Heart send new append message: %+v to server: %d", req, i)
+						ok := rf.sendAppendEntries(i, req, &reply)
+						if ok {
+							if newEntries == nil {
+								appendMsg := &AppendEntriesMessage{request: req, reply: &reply, toServerId: i}
+								rf.messageCh <- &Message{Type: MsgHeartbeatResp, payload: appendMsg}
+							} else {
+								appendMsg := &AppendEntriesMessage{request: req, reply: &reply, toServerId: i}
+								rf.messageCh <- &Message{Type: MsgAppendEntriesResp, payload: appendMsg}
+							}
+						} else {
+							//rf.logger.Debugf("Send heartbeat failed to server: %d", i)
+						}
+					}(i, rf.currentTerm, rf.commitIndex)
+				}
 			}
 		}
 	//}
@@ -1246,6 +1417,8 @@ func (rf *Raft) syncAppendEntries() {
 					if ok {
 						payload := &AppendEntriesMessage{request: req, reply: &reply, toServerId: i}
 						rf.messageCh <- &Message{Type: MsgAppendEntriesResp, payload: payload}
+					} else {
+						//rf.logger.Debugf("Append entries rpc failed")
 					}
 				}(i, rf.currentTerm, rf.nextIndex[i], rf.commitIndex, appendReqID)
 			}
@@ -1309,7 +1482,7 @@ func (rf *Raft) resetPeerIndices() {
 func (rf *Raft) Snapshot(snapShot []byte, index int, doneChan chan *Message) {
 
 	go func() {
-		rf.messageCh <- &Message{Type: MsgTakeSnapShot, payload: &SnapShotMsg{snapShot: snapShot, ssIndex: index}, doneChan: doneChan}
+		rf.messageCh <- &Message{Type: MsgTakeSnapShot, payload: &SnapshotMsg{snapshot: &Snapshot{Snapshot: snapShot, SnapshotIndex: index} }, doneChan: doneChan}
 	}()
 }
 

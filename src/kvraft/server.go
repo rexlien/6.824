@@ -326,66 +326,75 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	go func(maxRaftState int) {
 		for !kv.killed() {
 			select {
-			case <- time.After(10 * time.Millisecond):
-				break
+			//case <- time.After(10 * time.Millisecond):
+			//	break
 			case applyMsg := <- kv.applyCh:
-				op := applyMsg.Command.(Op)
-				//kv.logger.Debugf("apply start server: %d key:%s, value:%s", kv.me, op.Key, op.Value)
-				var result interface{} = nil
-				if op.OpType == GET {
-					result = kv.kv.KV[op.Key]
-				} else {
 
-					reqID, ok := kv.curClientReqID.Load(op.ClientID)
-					duplicateFound := false
-					if ok && reqID == op.ReqID {
-						duplicateFound = true
-					}
-					if !duplicateFound {
-						if op.OpType == PUT {
-							kv.kv.KV[op.Key] = op.Value
-							result = kv.kv.KV[op.Key]
-						} else {
-							//append(kv.kvState[op.Key].([]string), op.Value)
-							kv.kv.KV[op.Key] += op.Value
-							result = kv.kv.KV[op.Key]
+				if applyMsg.CommandValid {
+					op := applyMsg.Command.(Op)
+					kv.logger.Debugf("apply start server: %d key:%s, value:%s", kv.me, op.Key, op.Value)
+					var result interface{} = nil
+					if op.OpType == GET {
+						result = kv.kv.KV[op.Key]
+					} else {
+
+						reqID, ok := kv.curClientReqID.Load(op.ClientID)
+						duplicateFound := false
+						if ok && reqID == op.ReqID {
+							duplicateFound = true
 						}
-						kv.curClientReqID.Store(op.ClientID, op.ReqID)
+						if !duplicateFound {
+							if op.OpType == PUT {
+								kv.kv.KV[op.Key] = op.Value
+								result = kv.kv.KV[op.Key]
+							} else {
+								//append(kv.kvState[op.Key].([]string), op.Value)
+								kv.kv.KV[op.Key] += op.Value
+								result = kv.kv.KV[op.Key]
+							}
+							kv.curClientReqID.Store(op.ClientID, op.ReqID)
+						}
 					}
-				}
-				opResult := &OpResult{opType: op.OpType, result: result }
-				//fmt.Printf("start result channel")
+					opResult := &OpResult{opType: op.OpType, result: result}
+					//fmt.Printf("start result channel")
 
-				channelMap, ok := kv.clientResultChan.Load(op.ClientID)
-				if ok {
-					channel, ok := channelMap.(*sync.Map).Load(op.ReqID)
-					//go func() {
+					channelMap, ok := kv.clientResultChan.Load(op.ClientID)
 					if ok {
-						select {
-						case channel.(chan *OpResult) <- opResult:
-							break
-						case <-time.After(1000 * time.Millisecond):
-							kv.logger.Warn("result wait too long, must be leader changed")
+						channel, ok := channelMap.(*sync.Map).Load(op.ReqID)
+						//go func() {
+						if ok {
+							select {
+							case channel.(chan *OpResult) <- opResult:
+								break
+							case <-time.After(1000 * time.Millisecond):
+								kv.logger.Warn("result wait too long, must be leader changed")
+							}
 						}
 					}
+
+					currentSize := persister.RaftStateSize()
+
+					if maxraftstate != -1 && currentSize >= maxRaftState {
+
+						bytes := kv.kv.Encode()
+						snapShotIndex := applyMsg.CommandIndex
+						kv.logger.Warnf("Start snapshot from index: %d Size: %d / %d", snapShotIndex, currentSize, maxraftstate)
+
+						doneChannel := make(chan *raft.Message)
+						kv.rf.Snapshot(bytes, snapShotIndex, doneChannel)
+
+						_ = <-doneChannel
+
+					}
+				} else {
+					//apply snapshot
+					snapShot := applyMsg.Command.(*raft.Snapshot)
+					kv.kv.Decode(snapShot.Snapshot)
+
 				}
 
-				currentSize := persister.RaftStateSize()
 
-				if maxraftstate != -1 && currentSize >= maxRaftState {
-
-					bytes := kv.kv.Encode()
-					snapShotIndex := applyMsg.CommandIndex
-					kv.logger.Warnf("Start snapshot from index: %d Size: %d / %d", snapShotIndex, currentSize, maxraftstate)
-
-					doneChannel := make(chan *raft.Message)
-
-					kv.rf.Snapshot(bytes, snapShotIndex, doneChannel)
-
-					_ = <-doneChannel
-
-				}
-				//kv.logger.Debugf("apply end")
+				kv.logger.Debugf("apply end")
 			}
 
 
