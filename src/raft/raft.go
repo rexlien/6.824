@@ -396,12 +396,9 @@ func (rf *Raft) AppendEntries(args *AppendEntryRequest, reply *AppendEntryReply)
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotRequest, reply *InstallSnapshotReply) {
 
-
-	rf.logger.Debugf("recieved install snapshot")
 	req := &Message{MsgInstallSnapshot,&RequestPair{args, reply}, make(chan *Message)}
 	rf.receiveChan <- req
 	req = <- req.doneChan
-
 
 }
 
@@ -694,6 +691,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				}
 			case msg := <-rf.messageCh:
 				if msg.Type == MsgInstallSnapshotResp {
+					rf.logger.Debugf("install snapshot response received")
 
 					installMsg := msg.payload.(*InstallSnapshotMessage)
 					if installMsg.reply.Term > rf.currentTerm {
@@ -707,8 +705,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					} else {
 
 						rf.logger.Debugf("snapshot install received with index %d", installMsg.snapshotIndex)
-						if rf.nextIndex[installMsg.toServerId] < installMsg.snapshotIndex {
-							rf.nextIndex[installMsg.toServerId] = installMsg.snapshotIndex
+						nextIndex := installMsg.snapshotIndex + 1
+						if rf.nextIndex[installMsg.toServerId] < nextIndex {
+							rf.nextIndex[installMsg.toServerId] = nextIndex
 						}
 
 					}
@@ -856,13 +855,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 								}
 
-
-								//}
-
-								//if rf.nextIndex[appendEntriesMsg.toServerId] < newCommitIndex {
-								//	rf.nextIndex[appendEntriesMsg.toServerId] = newCommitIndex
-								//}
-
 							} else if appendReply.Success == AeEntriesAppendFailed {
 
 								if rf.state == LEADER && appendEntriesMsg.request.Term == rf.currentTerm {
@@ -877,13 +869,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 										rf.nextIndex[appendEntriesMsg.toServerId] = appendEntriesMsg.reply.XLen + 1
 
 										newPrev := appendEntriesMsg.reply.XLen
+										rf.logger.Debugf("XLen = %d", newPrev )
 										newPrevTerm := 0
-										if newPrev > 0 {
-											newPrevTerm = rf.logs.GetEntry(newPrev - 1).Term
-										}
-										entries := rf.logs.GetEntriesByIndex(newPrev + 1, -1)
 
-										rf.resendAppendEntriesMessage(entries, appendEntriesMsg, newPrev, newPrevTerm)
+										if newPrev != 0 && newPrev < rf.logs.FirstIndex() {
+											rf.sendInstallSnapshot(appendEntriesMsg.toServerId, rf.me, rf.currentTerm, rf.persister.ReadSnapshot())
+										} else {
+											if newPrev > 0 {
+												newPrevTerm = rf.logs.GetEntry(newPrev - 1).Term
+											}
+											entries := rf.logs.GetEntriesByIndex(newPrev+1, -1)
+
+											rf.resendAppendEntriesMessage(entries, appendEntriesMsg, newPrev, newPrevTerm)
+										}
 										//appendEntriesMsg.toServerId
 
 									} else {
@@ -917,7 +915,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 						request := msg.payload.(*RequestPair).request.(*InstallSnapshotRequest)
 						reply := msg.payload.(*RequestPair).reply.(*InstallSnapshotReply)
-
+						reply.Term = rf.currentTerm
 						if rf.state == LEADER {
 							rf.logger.Warnf("Leader should not install snapshot")
 							msg.doneChan <- msg
@@ -930,14 +928,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 							break
 						}
 
-						rf.logger.Debugf("Install snapshot!")
+						rf.logger.Debugf("Install snapshot start!")
 						//Do install
 						doneChan := make(chan *CommitMsg)
 						snapshot := NewSnapshot(request.Data)
+						//install log
+						rf.logs.Decode(snapshot.Log)
+
+						//send commit msg to install kv
 						rf.commitCh <- &CommitMsg{snapshot: snapshot, doneCh: doneChan, commitIndex: snapshot.SnapshotIndex}
 						_ = <-doneChan
 
-
+						rf.logger.Debugf("Install snapshot done!")
+						msg.doneChan <- msg
 
 
 					} else if msg.Type == MsgReceiveRequest {
@@ -1020,7 +1023,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 									if appendEntriesArg.PrevLogIndex > 0 {
 
-										rf.logger.Debugf("PrevLogIndex: %d", appendEntriesArg.PrevLogIndex)
+										rf.logger.Debugf("PrevLogIndex: %d, LastLogIndex: %d", appendEntriesArg.PrevLogIndex, rf.logs.LastIndex())
 										logIndex := appendEntriesArg.PrevLogIndex
 										if logIndex <= rf.logs.LastIndex() {
 
@@ -1089,7 +1092,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 											//prev index is empty
 											appendEntriesReply.XTerm = -1
 											appendEntriesReply.XIndex = -1
-											appendEntriesReply.XLen = rf.logs.Len()
+											appendEntriesReply.XLen = rf.logs.LastIndex()//rf.logs.Len()
 
 											rf.logger.Debugf("prev Index not exist :%s", rf.logs.ToString())
 											appendEntriesReply.Success = AeEntriesAppendFailed
@@ -1134,12 +1137,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 												appendEntriesReply.Success = AeEntriesAppendFailed
 											}
 										} else {
-											//appendEntriesReply.XTerm = -1
-											//appendEntriesReply.XIndex = -1
-											//appendEntriesReply.XLen = rf.logs.Len()
+											appendEntriesReply.XTerm = -1
+											appendEntriesReply.XIndex = -1
+											appendEntriesReply.XLen = rf.logs.LastIndex()//rf.logs.Len()
 
-											//rf.logger.Debugf("prev Index not exist :%s", rf.logs.ToString())
-											//appendEntriesReply.Success = AeEntriesAppendFailed
+											rf.logger.Debugf("prev Index not exist :%s", rf.logs.ToString())
+											appendEntriesReply.Success = AeEntriesAppendFailed
 										}
 									}
 									//appendEntriesReply.Success = AeEntriesAppendSuccess
@@ -1326,38 +1329,14 @@ func (rf *Raft) sendHeartbeat() {
 				if rf.nextIndex[i] <= prevIndex {
 
 					rf.logger.Debugf("install Snaphost for server: %d", i)
-					go func(i int, leaderID int, term int, data []byte) {
 
-						req := &InstallSnapshotRequest{}
-						reply := InstallSnapshotReply{}
-
-						snapshot := NewSnapshot(data)
-
-
-						req.LeaderID = leaderID
-						req.Term = term
-						req.LastIncludedIndex = snapshot.SnapshotIndex
-						req.LastIncludedTerm = snapshot.SnapshotTerm
-						req.Done = true
-						req.Offset = 0
-						req.Data = data
-
-
-						ok := rf.installSnapshot(i, req, &reply)
-						if ok {
-							rf.logger.Debugf("Install snapshot succeeded!!!")
-							rf.messageCh <- &Message{Type: MsgInstallSnapshotResp, payload: &InstallSnapshotMessage{request: req, reply: &reply, toServerId: i, snapshotIndex: prevIndex}}
-						} else {
-							rf.logger.Debugf("Install snapshot rpc failed!")
-						}
-					}(i, rf.me, rf.currentTerm, rf.persister.ReadSnapshot())
-
+					rf.sendInstallSnapshot(i, rf.me, rf.currentTerm, rf.persister.ReadSnapshot())
 
 				} else {
 					if lastIndex >= rf.nextIndex[i] {
 
 						newEntries = rf.logs.GetEntriesByIndex(rf.nextIndex[i], -1)
-						prevIndex, _, prevTerm = rf.logs.GetEntryByIndex(rf.nextIndex[i] - 1)
+						prevIndex, _, prevTerm = rf.logs.PrevEntry(rf.nextIndex[i])
 					}
 
 					go func(i int, term int, leaderCommitIndex int) {
@@ -1465,6 +1444,38 @@ func (rf *Raft) resendAppendEntriesMessage(entries []*raft.LogEntry, message *Ap
 			rf.messageCh <- &Message{Type: MsgAppendEntriesResp, payload: payload}
 		}
 	}(message.toServerId, message.request.Term, message.request.LeaderCommit, message.request.RequestID)
+
+}
+
+func (rf *Raft) sendInstallSnapshot(serverID int, leaderID int, term int, data []byte ) {
+
+	rf.logger.Debugf("send install snapshot to %d", serverID)
+	go func(i int, leaderID int, term int, data []byte) {
+
+		req := &InstallSnapshotRequest{}
+		reply := InstallSnapshotReply{}
+
+		snapshot := NewSnapshot(data)
+
+
+		req.LeaderID = leaderID
+		req.Term = term
+		req.LastIncludedIndex = snapshot.SnapshotIndex
+		req.LastIncludedTerm = snapshot.SnapshotTerm
+		req.Done = true
+		req.Offset = 0
+		req.Data = data
+
+
+		ok := rf.installSnapshot(i, req, &reply)
+		if ok {
+			//rf.logger.Debugf("Install snapshot succeeded!!!")
+			rf.messageCh <- &Message{Type: MsgInstallSnapshotResp, payload: &InstallSnapshotMessage{request: req, reply: &reply, toServerId: i, snapshotIndex: snapshot.SnapshotIndex}}
+		} else {
+			rf.logger.Debugf("Install snapshot rpc failed!")
+		}
+	}(serverID, leaderID, term, data)
+
 
 }
 
