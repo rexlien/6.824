@@ -1027,18 +1027,37 @@ func Make(peers []*labrpc.ClientEnd, me int,
 										logIndex := appendEntriesArg.PrevLogIndex
 										if logIndex <= rf.logs.LastIndex() {
 
-											if appendEntriesArg.PrevLogTerm != rf.logs.GetEntryByLogIndex(logIndex).Term {
+											//less than first index
+											if logIndex < rf.logs.FirstIndex() {
+
+												if logIndex == rf.logs.Offset() {
+													if appendEntriesArg.PrevLogTerm == rf.logs.IncludedTerm {
+														rf.logs.ReplaceEntriesFrom(appendEntriesArg.Entries, logIndex, true)
+														rf.logger.Debugf("[Log] conflict update, %s", rf.logs.ToString())
+														appendEntriesReply.Success = AeEntriesAppendSuccess
+													} else {
+														appendEntriesReply.XIndex = logIndex
+														appendEntriesReply.Success = AeEntriesAppendFailed
+													}
+												} else {
+
+													appendEntriesReply.XIndex = logIndex
+													appendEntriesReply.Success = AeEntriesAppendFailed
+												}
+
+
+											} else if appendEntriesArg.PrevLogTerm != rf.logs.GetEntryByLogIndex(logIndex).Term {
 
 												appendEntriesReply.XTerm = rf.logs.GetEntryByLogIndex(logIndex).Term
-												xIndex := 1
-												for xIndex := logIndex; xIndex >= 1; xIndex-- {
+												xIndex := logIndex
+												for ;xIndex >= rf.logs.FirstIndex(); xIndex-- {
 
 													if rf.logs.GetEntryByLogIndex(xIndex).Term != appendEntriesReply.XTerm {
-														xIndex++
+														//xIndex++
 														break
 													}
 												}
-
+												xIndex++
 												appendEntriesReply.XIndex = xIndex
 												//rf.logger.Debugf("append entries not consistent of term %d, from %d: log: %s", appendEntriesReply.XTerm, appendEntriesReply.XIndex, rf.printLog())
 												appendEntriesReply.Success = AeEntriesAppendFailed
@@ -1123,15 +1142,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 											if appendEntriesArg.PrevLogTerm != rf.logs.GetEntryByLogIndex(logIndex).Term {
 
 												appendEntriesReply.XTerm = rf.logs.GetEntryByLogIndex(logIndex).Term
-												xIndex := 1
-												for xIndex := logIndex; xIndex >= 1; xIndex-- {
+												xIndex := logIndex
+												for ; xIndex >= rf.logs.FirstIndex(); xIndex-- {
 
 													if rf.logs.GetEntryByLogIndex(xIndex).Term != appendEntriesReply.XTerm {
-														xIndex++
+														//xIndex++
 														break
 													}
 												}
-
+												xIndex++
 												appendEntriesReply.XIndex = xIndex
 												//rf.logger.Debugf("append entries not consistent of term %d, from %d: log: %s", appendEntriesReply.XTerm, appendEntriesReply.XIndex, rf.printLog())
 												appendEntriesReply.Success = AeEntriesAppendFailed
