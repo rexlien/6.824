@@ -872,38 +872,43 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 										rf.nextIndex[appendEntriesMsg.toServerId] = appendEntriesMsg.reply.XLen + 1
 
-										newPrev := appendEntriesMsg.reply.XLen
-										rf.logger.Debugf("XLen = %d", newPrev )
-										newPrevTerm := 0
+										//newPrev := appendEntriesMsg.reply.XLen
+										//rf.logger.Debugf("XLen = %d", newPrev )
+										//newPrevTerm := 0
 
-										if newPrev != 0 && newPrev < rf.logs.FirstIndex() {
+
+										if rf.nextIndex[appendEntriesMsg.toServerId] < rf.logs.FirstIndex() {
 											rf.sendInstallSnapshot(appendEntriesMsg.toServerId, rf.me, rf.currentTerm, rf.persister.ReadSnapshot())
 										} else {
-											if newPrev > 0 {
-												newPrevTerm = rf.logs.GetEntry(newPrev - 1).Term
-											}
-											entries := rf.logs.GetEntriesByIndex(newPrev+1, -1)
+
+											newPrev, _, newPrevTerm := rf.logs.PrevEntry(rf.nextIndex[appendEntriesMsg.toServerId])
+											//if newPrev > 0 {
+
+											//	newPrevTerm = rf.logs.GetEntryByLogIndex(newPrev).Term
+											//}
+											entries := rf.logs.GetEntriesByIndex(rf.nextIndex[appendEntriesMsg.toServerId], -1)
 
 											rf.resendAppendEntriesMessage(entries, appendEntriesMsg, newPrev, newPrevTerm)
 										}
-										//appendEntriesMsg.toServerId
+
 
 									} else {
 										//need to send from xindex
 										rf.logger.Debugf("Term recovery from Term :%d, Index :%d", appendEntriesMsg.reply.Term, appendEntriesMsg.reply.XIndex)
 										rf.nextIndex[appendEntriesMsg.toServerId] = appendEntriesMsg.reply.XIndex
 
-										//to previous array index
-										newPrev := appendEntriesMsg.reply.XIndex - 2
-										if newPrev < 0 {
-											newPrev = 0
-										}
 
-										if newPrev != 0 && newPrev < rf.logs.FirstIndex() {
+										//if newPrev < 0 {
+										//	newPrev = 0
+										//}
+
+										if rf.nextIndex[appendEntriesMsg.toServerId] < rf.logs.FirstIndex() {
 											rf.sendInstallSnapshot(appendEntriesMsg.toServerId, rf.me, rf.currentTerm, rf.persister.ReadSnapshot())
 										} else {
-											newPrevTerm := rf.logs.GetEntry(newPrev).Term
-											entries := rf.logs.GetEntriesByIndex(newPrev+1, -1)
+											//newPrev := appendEntriesMsg.reply.XIndex - 1
+											newPrev, _, newPrevTerm := rf.logs.PrevEntry(rf.nextIndex[appendEntriesMsg.toServerId])
+											//newPrevTerm := rf.logs.GetEntry(newPrev - 1).Term
+											entries := rf.logs.GetEntriesByIndex(rf.nextIndex[appendEntriesMsg.toServerId], -1)
 
 											rf.resendAppendEntriesMessage(entries, appendEntriesMsg, newPrev, newPrevTerm)
 										}
