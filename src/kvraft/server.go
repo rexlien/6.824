@@ -394,7 +394,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				}
 
 
-				kv.logger.Debugf("apply end")
+				//kv.logger.Debugf("apply end")
 			}
 
 

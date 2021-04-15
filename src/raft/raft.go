@@ -72,7 +72,10 @@ type StartCommand struct {
 
 type CommitMsg struct {
 	commitIndex int
-	//raftStateSize int
+	//this is needed since log might be
+	command interface{}
+
+
 	snapshot *Snapshot
 	doneCh chan *CommitMsg
 }
@@ -588,7 +591,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.messageCh = make(chan *Message)
 	rf.receiveChan = make(chan *Message)
 	rf.startCh = make(chan* Message)
-	rf.commitCh = make(chan *CommitMsg)
+	rf.commitCh = make(chan *CommitMsg, 5000)
 	rf.appendResults = make(map[int64][]*AppendEntryReply)
 	rf.applyCh = applyCh
 	rf.setVotedFor(-1, false)//votedFor = -1
@@ -809,7 +812,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 									nextCommit := n
 
 									for {
-										rf.logger.Debugf("updating n %d...", n)
+										//rf.logger.Debugf("updating n %d...", n)
 										if n > rf.logs.LastIndex() {
 											rf.logger.Warnf("break: commit index %d greater than last log index: %d", n, rf.logs.LastIndex())
 											break
@@ -845,12 +848,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 										rf.logger.Debugf("Do actual commit %d", nextCommit)
 										rf.commitIndex = nextCommit
-										go func(logger *zap.SugaredLogger) {
+										//go func(logger *zap.SugaredLogger) {
 
 											//logger.Infof("Trigger commit!")
-											rf.commitCh <- &CommitMsg{commitIndex: rf.commitIndex}
-
-										}(rf.logger)
+										//	rf.commitCh <- &CommitMsg{commitIndex: rf.commitIndex}
+										//
+										//}(rf.logger)
+										rf.applyCommitted(rf.commitIndex)
 									}
 
 								}
@@ -894,10 +898,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 										if newPrev < 0 {
 											newPrev = 0
 										}
-										newPrevTerm := rf.logs.GetEntry(newPrev).Term
-										entries := rf.logs.GetEntriesByIndex(newPrev + 1, -1)
 
-										rf.resendAppendEntriesMessage(entries, appendEntriesMsg, newPrev, newPrevTerm)
+										if newPrev != 0 && newPrev < rf.logs.FirstIndex() {
+											rf.sendInstallSnapshot(appendEntriesMsg.toServerId, rf.me, rf.currentTerm, rf.persister.ReadSnapshot())
+										} else {
+											newPrevTerm := rf.logs.GetEntry(newPrev).Term
+											entries := rf.logs.GetEntriesByIndex(newPrev+1, -1)
+
+											rf.resendAppendEntriesMessage(entries, appendEntriesMsg, newPrev, newPrevTerm)
+										}
 									}
 
 								} else {
@@ -1187,10 +1196,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 									}
 									rf.logger.Debugf("send commit, commit index:%d", rf.commitIndex)
 
-									go func(commitIndex int) {
-										rf.commitCh <- &CommitMsg{commitIndex: commitIndex}
-									}(rf.commitIndex)
-
+									//go func(commitIndex int) {
+									//	rf.commitCh <- &CommitMsg{commitIndex: commitIndex}
+									//} (rf.commitIndex)
+									rf.applyCommitted(rf.commitIndex)
 								}
 							}
 
@@ -1210,7 +1219,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 					rf.logger.Debugf("Committed received")
 					//if it's not a snap shot commit
 					if commitMsg.snapshot == nil {
-						rf.applyCommitted(commitMsg.commitIndex)
+						//rf.applyCommitted(commitMsg.commitIndex)
+						applyMsg := ApplyMsg{Command: commitMsg.command, CommandValid: true, CommandIndex: commitMsg.commitIndex}
+						rf.applyCh <- applyMsg
 					} else {
 						rf.logger.Debugf("Applying snapshot")
 						rf.applySnapshot(commitMsg.snapshot)
@@ -1274,8 +1285,11 @@ func (rf *Raft) applyCommitted(commitIndex int) {
 		for i := rf.lastApplied + 1; i <= commitIndex; i++ {
 			command := rf.logs.GetEntry(i-1).Command
 
-			applyMsg := ApplyMsg{Command: command, CommandValid: true, CommandIndex: i}
-			rf.applyCh <- applyMsg
+			//go func(i int) {
+			rf.commitCh <- &CommitMsg{commitIndex: i, command: command}
+			//}(i)
+			//applyMsg := ApplyMsg{Command: command, CommandValid: true, CommandIndex: i}
+			//rf.applyCh <- applyMsg
 
 		}
 		rf.logger.Infof("End apply from %d to %d", rf.lastApplied + 1, rf.commitIndex)
