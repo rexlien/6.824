@@ -1050,12 +1050,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 														rf.logger.Debugf("[Log] conflict update, %s", rf.logs.ToString())
 														appendEntriesReply.Success = AeEntriesAppendSuccess
 													} else {
-														appendEntriesReply.XIndex = logIndex
+
+														//rf.logger.Debugf()
+														appendEntriesReply.XIndex = rf.logs.FirstIndex()
 														appendEntriesReply.Success = AeEntriesAppendFailed
 													}
 												} else {
 
-													appendEntriesReply.XIndex = logIndex
+													appendEntriesReply.XIndex = rf.logs.FirstIndex()
 													appendEntriesReply.Success = AeEntriesAppendFailed
 												}
 
@@ -1064,15 +1066,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 												appendEntriesReply.XTerm = rf.logs.GetEntryByLogIndex(logIndex).Term
 												xIndex := logIndex
+
 												for ;xIndex >= rf.logs.FirstIndex(); xIndex-- {
 
-													if rf.logs.GetEntryByLogIndex(xIndex).Term != appendEntriesReply.XTerm {
+													if rf.logs.GetEntryByLogIndex(xIndex).Term == appendEntriesArg.PrevLogTerm {
 														//xIndex++
 														break
 													}
 												}
 												xIndex++
+												rf.logger.Debugf("xIndex = %d", xIndex)
+
 												appendEntriesReply.XIndex = xIndex
+
 												//rf.logger.Debugf("append entries not consistent of term %d, from %d: log: %s", appendEntriesReply.XTerm, appendEntriesReply.XIndex, rf.printLog())
 												appendEntriesReply.Success = AeEntriesAppendFailed
 
@@ -1157,14 +1163,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 												appendEntriesReply.XTerm = rf.logs.GetEntryByLogIndex(logIndex).Term
 												xIndex := logIndex
+
 												for ; xIndex >= rf.logs.FirstIndex(); xIndex-- {
 
-													if rf.logs.GetEntryByLogIndex(xIndex).Term != appendEntriesReply.XTerm {
+													if rf.logs.GetEntryByLogIndex(xIndex).Term == appendEntriesArg.PrevLogTerm {
 														//xIndex++
 														break
 													}
 												}
 												xIndex++
+												rf.logger.Debugf("xIndex = %d", xIndex)
+
 												appendEntriesReply.XIndex = xIndex
 												//rf.logger.Debugf("append entries not consistent of term %d, from %d: log: %s", appendEntriesReply.XTerm, appendEntriesReply.XIndex, rf.printLog())
 												appendEntriesReply.Success = AeEntriesAppendFailed
