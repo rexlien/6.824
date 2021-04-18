@@ -1048,7 +1048,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 													if appendEntriesArg.PrevLogTerm == rf.logs.IncludedTerm {
 														rf.logs.ReplaceEntriesFrom(appendEntriesArg.Entries, logIndex, true)
 														rf.logger.Debugf("[Log] conflict update, %s", rf.logs.ToString())
+														rf.persist()
 														appendEntriesReply.Success = AeEntriesAppendSuccess
+
 													} else {
 
 														//rf.logger.Debugf()
