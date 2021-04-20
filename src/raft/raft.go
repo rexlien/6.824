@@ -284,9 +284,12 @@ func (rf *Raft) persist() {
 	data := rf.encodeState()
 	rf.persister.SaveRaftState(data)
 
-	//rf.currentTerm
-	//rf.log
-	//rf
+}
+
+func (rf *Raft) persistWithSnapshot(snapshot []byte) {
+
+	data := rf.encodeState()
+	rf.persister.SaveStateAndSnapshot(data, snapshot)
 }
 
 func (rf *Raft) encodeState() []byte {
@@ -720,6 +723,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 					snapshotMsg := msg.payload.(*SnapshotMsg)
 
+					rf.logger.Debugf("Taking snapshot from index %d", snapshotMsg.snapshot.SnapshotIndex)
+
 					ok, logSnap, includeTerm := rf.logs.SnapShot(snapshotMsg.snapshot.SnapshotIndex)
 
 					if ok {
@@ -728,6 +733,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						snapshotMsg.snapshot.SnapshotTerm = includeTerm
 						snapShotByte := snapshotMsg.snapshot.Encode()
 						rf.persister.SaveStateAndSnapshot(state, snapShotByte)
+					} else {
+						panic("taking snapshot fail")
 					}
 					msg.doneChan <- msg
 
@@ -944,14 +951,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 						rf.logger.Debugf("Install snapshot start!")
 						//Do install
-						doneChan := make(chan *CommitMsg)
+
 						snapshot := NewSnapshot(request.Data)
 						//install log
-						rf.logs.Decode(snapshot.Log)
-
+						//rf.logs.Decode(snapshot.Log)
 						//send commit msg to install kv
-						rf.commitCh <- &CommitMsg{snapshot: snapshot, doneCh: doneChan, commitIndex: snapshot.SnapshotIndex}
-						_ = <-doneChan
+						//rf.commitCh <- &CommitMsg{snapshot: snapshot, doneCh: doneChan, commitIndex: snapshot.SnapshotIndex}
+						rf.applySnapshot(snapshot)
+						//_ = <-doneChan
 
 						rf.logger.Debugf("Install snapshot done!")
 						msg.doneChan <- msg
@@ -1159,7 +1166,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 										//arrayIndex := appendEntriesArg.PrevLogIndex - 1
 										rf.logger.Debugf("PrevLogIndex: %d", appendEntriesArg.PrevLogIndex)
 										logIndex := appendEntriesArg.PrevLogIndex
-										if logIndex <= rf.logs.LastIndex() {
+										if logIndex < rf.logs.FirstIndex() {
+											rf.logger.Debugf("log Index already truncated, ignore append")
+
+											appendEntriesReply.XTerm = rf.logs.FirstTerm()
+											appendEntriesReply.XIndex = rf.logs.FirstIndex()
+											appendEntriesReply.Success = AeEntriesAppendFailed
+										} else if logIndex <= rf.logs.LastIndex() {
 
 											if appendEntriesArg.PrevLogTerm != rf.logs.GetEntryByLogIndex(logIndex).Term {
 
@@ -1240,7 +1253,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						rf.applyCh <- applyMsg
 					} else {
 						rf.logger.Debugf("Applying snapshot")
-						rf.applySnapshot(commitMsg.snapshot)
+						//rf.applySnapshot(commitMsg.snapshot)
+						applyMsg := ApplyMsg{Command: commitMsg.snapshot, CommandValid: false, CommandIndex: commitMsg.commitIndex}
+						rf.applyCh <- applyMsg
 					}
 					if commitMsg.doneCh != nil {
 						commitMsg.doneCh <- commitMsg
@@ -1313,12 +1328,24 @@ func (rf *Raft) applyCommitted(commitIndex int) {
 	}
 }
 
-func (rf *Raft) applySnapshot(snapShot *Snapshot) {
+func (rf *Raft) applySnapshot(snapshot *Snapshot) {
 
 
-	applyMsg := ApplyMsg{Command: snapShot, CommandValid: false, CommandIndex: snapShot.SnapshotIndex}
-	rf.applyCh <- applyMsg
-	rf.lastApplied = snapShot.SnapshotIndex
+	//applyMsg := ApplyMsg{Command: snapShot, CommandValid: false, CommandIndex: snapShot.SnapshotIndex}
+	//rf.applyCh <- applyMsg
+	rf.logger.Debugf("Applying snapshot, index: %d, current lastApplied: %d", snapshot.SnapshotIndex, rf.lastApplied)
+	if snapshot.SnapshotIndex > rf.lastApplied {
+
+		doneChan := make(chan *CommitMsg)
+		rf.commitCh <- &CommitMsg{commitIndex: snapshot.SnapshotIndex, snapshot: snapshot, doneCh: doneChan}
+		_ = <-doneChan
+
+		rf.logs.Decode(snapshot.Log)
+		rf.persistWithSnapshot(snapshot.Encode())
+		rf.lastApplied = snapshot.SnapshotIndex
+	} else {
+		rf.logger.Debugf("Apply snapshot ignored, index: %d, current lastApplied: %d", snapshot.SnapshotIndex, rf.lastApplied)
+	}
 }
 
 
@@ -1498,6 +1525,9 @@ func (rf *Raft) resendAppendEntriesMessage(entries []*raft.LogEntry, message *Ap
 
 func (rf *Raft) sendInstallSnapshot(serverID int, leaderID int, term int, data []byte ) {
 
+	if data == nil {
+		panic("Data can't be nil")
+	}
 	rf.logger.Debugf("send install snapshot to %d", serverID)
 	go func(i int, leaderID int, term int, data []byte) {
 
