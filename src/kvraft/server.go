@@ -320,9 +320,29 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.clientMutexMap = sync.Map{}
 	kv.ticker = time.NewTicker(5000 * time.Millisecond)
 
-	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-
+	initDone := make(chan bool)
 	// You may need initialization code here.
+
+	//might need to handle snapshot init
+	//for snapshot handling when initial only
+	go func() {
+		select {
+			case applyMsg := <-kv.applyCh:
+				if !applyMsg.CommandValid {
+					snapShot := applyMsg.Command.(*raft.Snapshot)
+					kv.kv.Decode(snapShot.Snapshot)
+				}
+				_ = <- initDone
+			case _ = <- initDone:
+				break
+
+		}
+
+	}()
+
+	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	initDone <- true
+
 	go func(maxRaftState int) {
 		for !kv.killed() {
 			select {
@@ -400,6 +420,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 		}
 	}(kv.maxraftstate)
+
+	kv.logger.Debugf("KV Server created")
 
 	return kv
 }

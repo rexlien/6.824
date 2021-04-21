@@ -335,6 +335,20 @@ func (rf *Raft) encodeLog() []byte {
 	return data
 }
 
+func (rf *Raft) readSnapshot(byte []byte) bool {
+	if byte == nil || len(byte) < 1 {
+		return false
+	}
+
+	//r := bytes.NewBuffer(snapshot)
+	//d := labgob.NewDecoder(r)
+
+	snapShot := NewSnapshot(byte)
+	rf.applySnapshot(snapShot, false)
+	return true
+
+}
+
 //
 // restore previously persisted state.
 //
@@ -368,10 +382,7 @@ func (rf *Raft) readPersist(data []byte) bool {
 	 	rf.logs.Clear()
 
 	   for _, log := range logs {
-
-		   //logEntry := log.(raft.LogEntry)
 	   		rf.logs.AppendEntries(log)
-		   //rf.log = append(rf.log, &logEntry)
 	   }
 	 }
 
@@ -575,12 +586,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 
 
+
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 	//rf.log = make([]interface{}, 0)
 	rf.logs = raft.NewLogs()
+
+	rf.rootLoggerContext = CreateLogContext(zap.Int("server", rf.me))
+	rf.logger = WithLogContext(rf.rootLoggerContext, []zapcore.Field{}...).GetSugarLogger()
 
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
@@ -595,15 +610,39 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.receiveChan = make(chan *Message)
 	rf.startCh = make(chan* Message)
 	rf.commitCh = make(chan *CommitMsg, 5000)
-	rf.appendResults = make(map[int64][]*AppendEntryReply)
 	rf.applyCh = applyCh
+
+	go func() {
+		for !rf.killed() {
+			select {
+			//WWcase
+			case commitMsg := <-rf.commitCh:
+				rf.logger.Debugf("Committed received")
+				//if it's not a snap shot commit
+				if commitMsg.snapshot == nil {
+					//rf.applyCommitted(commitMsg.commitIndex)
+					applyMsg := ApplyMsg{Command: commitMsg.command, CommandValid: true, CommandIndex: commitMsg.commitIndex}
+					rf.applyCh <- applyMsg
+				} else {
+					rf.logger.Debugf("Applying snapshot")
+					//rf.applySnapshot(commitMsg.snapshot)
+					applyMsg := ApplyMsg{Command: commitMsg.snapshot, CommandValid: false, CommandIndex: commitMsg.commitIndex}
+					rf.applyCh <- applyMsg
+				}
+				if commitMsg.doneCh != nil {
+					commitMsg.doneCh <- commitMsg
+				}
+			}
+		}
+	}()
+	rf.appendResults = make(map[int64][]*AppendEntryReply)
+
 	rf.setVotedFor(-1, false)//votedFor = -1
 	rf.currentLeader = -1
 
-	rf.rootLoggerContext = CreateLogContext(zap.Int("server", rf.me))
-
+	rf.readSnapshot(persister.ReadSnapshot())
 	if !rf.readPersist(persister.ReadRaftState()) {
-		rf.logger = WithLogContext(rf.rootLoggerContext, []zapcore.Field{}...).GetSugarLogger() //rf.contextLogger
+		 //rf.contextLogger
 	}
 
 	rf.logger.Debugf("Raft created")
@@ -957,7 +996,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 						//rf.logs.Decode(snapshot.Log)
 						//send commit msg to install kv
 						//rf.commitCh <- &CommitMsg{snapshot: snapshot, doneCh: doneChan, commitIndex: snapshot.SnapshotIndex}
-						rf.applySnapshot(snapshot)
+						rf.applySnapshot(snapshot, true)
 						//_ = <-doneChan
 
 						rf.logger.Debugf("Install snapshot done!")
@@ -1240,29 +1279,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		fmt.Printf("Raft killed %d\n", rf.me)
 	}()
 
-	go func() {
-		for !rf.killed() {
-			select {
-				//WWcase
-				case commitMsg := <-rf.commitCh:
-					rf.logger.Debugf("Committed received")
-					//if it's not a snap shot commit
-					if commitMsg.snapshot == nil {
-						//rf.applyCommitted(commitMsg.commitIndex)
-						applyMsg := ApplyMsg{Command: commitMsg.command, CommandValid: true, CommandIndex: commitMsg.commitIndex}
-						rf.applyCh <- applyMsg
-					} else {
-						rf.logger.Debugf("Applying snapshot")
-						//rf.applySnapshot(commitMsg.snapshot)
-						applyMsg := ApplyMsg{Command: commitMsg.snapshot, CommandValid: false, CommandIndex: commitMsg.commitIndex}
-						rf.applyCh <- applyMsg
-					}
-					if commitMsg.doneCh != nil {
-						commitMsg.doneCh <- commitMsg
-					}
-			}
-		}
-	}()
+
 
 	return rf
 }
@@ -1328,7 +1345,7 @@ func (rf *Raft) applyCommitted(commitIndex int) {
 	}
 }
 
-func (rf *Raft) applySnapshot(snapshot *Snapshot) {
+func (rf *Raft) applySnapshot(snapshot *Snapshot, persist bool) {
 
 
 	//applyMsg := ApplyMsg{Command: snapShot, CommandValid: false, CommandIndex: snapShot.SnapshotIndex}
@@ -1341,7 +1358,9 @@ func (rf *Raft) applySnapshot(snapshot *Snapshot) {
 		_ = <-doneChan
 
 		rf.logs.Decode(snapshot.Log)
-		rf.persistWithSnapshot(snapshot.Encode())
+		if persist {
+			rf.persistWithSnapshot(snapshot.Encode())
+		}
 		rf.lastApplied = snapshot.SnapshotIndex
 	} else {
 		rf.logger.Debugf("Apply snapshot ignored, index: %d, current lastApplied: %d", snapshot.SnapshotIndex, rf.lastApplied)
@@ -1551,7 +1570,7 @@ func (rf *Raft) sendInstallSnapshot(serverID int, leaderID int, term int, data [
 			//rf.logger.Debugf("Install snapshot succeeded!!!")
 			rf.messageCh <- &Message{Type: MsgInstallSnapshotResp, payload: &InstallSnapshotMessage{request: req, reply: &reply, toServerId: i, snapshotIndex: snapshot.SnapshotIndex}}
 		} else {
-			rf.logger.Debugf("Install snapshot rpc failed!")
+			//rf.logger.Debugf("Install snapshot rpc failed!")
 		}
 	}(serverID, leaderID, term, data)
 
