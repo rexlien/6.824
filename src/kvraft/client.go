@@ -2,7 +2,7 @@ package kvraft
 
 import (
 	"../labrpc"
-	logger "github.com/rexlien/go-utils/xln-utils/logger"
+	logger "../go-utils/xln-utils/logger"
 	"go.uber.org/zap"
 	"sync/atomic"
 )

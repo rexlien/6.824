@@ -1,11 +1,11 @@
 package kvraft
 
 import (
+	"../go-utils/xln-utils/logger"
+	xlnraft "../go-utils/xln-utils/raft"
 	"../labgob"
 	"../labrpc"
 	"../raft"
-	xlnraft "../go-utils/xln-utils/raft"
-	"github.com/rexlien/go-utils/xln-utils/logger"
 	"go.uber.org/zap"
 	"log"
 	"sync"
